@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f2ede2">
+  <title>Eidolon Atlas</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+
+  <div class="ambient" aria-hidden="true"><span></span><span></span><span></span></div>
+
+  <main id="auth-view" class="auth-view" hidden>
+    <section class="auth-card" aria-labelledby="auth-title">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 48 48"><path d="M24 4.75 41 14.6v18.8L24 43.25 7 33.4V14.6L24 4.75Z"/><path d="M16 18.5h16M16 24h12M16 29.5h8"/></svg>
+      </div>
+      <p class="eyebrow">Private by design</p>
+      <h1 id="auth-title">Your personal atlas</h1>
+      <p id="auth-intro" class="auth-intro"></p>
+
+      <form id="setup-form" class="stack" hidden>
+        <div class="callout callout-warning">
+          <span data-icon="key"></span>
+          <p><strong>Your passphrase cannot be recovered.</strong> Store it somewhere safe. Without it, your atlas and backups cannot be opened.</p>
+        </div>
+        <label class="field"><span>Choose a passphrase</span><input name="passphrase" type="password" autocomplete="new-password" minlength="12" required><small>Use at least 12 characters. A long, unique phrase works well.</small></label>
+        <label class="field"><span>Confirm passphrase</span><input name="confirmation" type="password" autocomplete="new-password" minlength="12" required></label>
+        <label class="check-row"><input name="acknowledge" type="checkbox" required><span>I understand that there is no passphrase reset.</span></label>
+        <button class="button button-primary button-wide" type="submit"><span data-icon="lock"></span>Create encrypted atlas</button>
+      </form>
+
+      <form id="unlock-form" class="stack" hidden>
+        <label class="field"><span>Passphrase</span><input name="passphrase" type="password" autocomplete="current-password" required autofocus></label>
+        <button class="button button-primary button-wide" type="submit"><span data-icon="unlock"></span>Unlock atlas</button>
+        <p class="microcopy">Your passphrase is used only to unlock this session. It is never stored by this page.</p>
+      </form>
+    </section>
+  </main>
+
+  <div id="app" class="app-shell" hidden>
+    <aside id="sidebar" class="sidebar" aria-label="Atlas navigation">
+      <div class="sidebar-brand">
+        <div class="brand-mark brand-mark-small" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M24 4.75 41 14.6v18.8L24 43.25 7 33.4V14.6L24 4.75Z"/><path d="M16 18.5h16M16 24h12M16 29.5h8"/></svg></div>
+        <div><strong>Eidolon</strong><span>Atlas</span></div>
+        <button id="close-sidebar" class="icon-button sidebar-close" type="button" aria-label="Close navigation" data-icon="close"></button>
+      </div>
+      <nav id="category-nav" class="category-nav"></nav>
+      <div class="sidebar-foot">
+        <button id="trash-button" class="nav-row" type="button"><span data-icon="trash"></span><span>Recently removed</span><span id="trash-count" class="count-pill">0</span></button>
+        <button id="backup-button" class="nav-row" type="button"><span data-icon="archive"></span><span>Backup &amp; restore</span></button>
+        <button id="lock-button" class="nav-row" type="button"><span data-icon="lock"></span><span>Lock atlas</span></button>
+      </div>
+    </aside>
+    <button id="sidebar-scrim" class="sidebar-scrim" type="button" aria-label="Close navigation" hidden></button>
+
+    <section class="workspace">
+      <header class="topbar">
+        <button id="open-sidebar" class="icon-button menu-button" type="button" aria-label="Open navigation" data-icon="menu"></button>
+        <label class="search-box">
+          <span class="sr-only">Search your atlas</span><span data-icon="search"></span>
+          <input id="global-search" type="search" placeholder="Search your atlas" autocomplete="off">
+          <kbd aria-hidden="true">/</kbd>
+        </label>
+        <button id="new-record-top" class="button button-primary compact" type="button"><span data-icon="plus"></span><span class="button-label">Add entry</span></button>
+      </header>
+
+      <main id="main-content" class="main-content" tabindex="-1">
+        <header class="view-heading">
+          <div>
+            <p id="view-eyebrow" class="eyebrow"></p>
+            <h1 id="view-title"></h1>
+            <p id="view-description" class="view-description"></p>
+          </div>
+          <div class="heading-actions">
+            <div id="view-toggle" class="segmented" aria-label="Display style" hidden>
+              <button type="button" data-view="cards" aria-label="Card view" data-icon="grid"></button>
+              <button type="button" data-view="list" aria-label="List view" data-icon="list"></button>
+            </div>
+            <button id="new-record" class="button button-primary" type="button"><span data-icon="plus"></span><span>Add entry</span></button>
+          </div>
+        </header>
+
+        <div id="filter-bar" class="filter-bar"></div>
+        <div id="content-stage" class="content-stage" aria-live="polite"></div>
+      </main>
+    </section>
+
+    <aside id="detail-pane" class="detail-pane" aria-labelledby="detail-title" aria-hidden="true">
+      <header class="detail-header">
+        <button id="close-detail" class="icon-button" type="button" aria-label="Close details" data-icon="close"></button>
+        <div class="detail-header-actions">
+          <button id="detail-edit" class="icon-button" type="button" aria-label="Edit entry" data-icon="edit"></button>
+          <button id="detail-remove" class="icon-button danger" type="button" aria-label="Move to recently removed" data-icon="trash"></button>
+        </div>
+      </header>
+      <div id="detail-content" class="detail-scroll"></div>
+    </aside>
+  </div>
+
+  <div id="notice-region" class="notice-region" aria-live="polite" aria-atomic="true"></div>
+
+  <dialog id="record-dialog" class="modal">
+    <form id="record-form" method="dialog">
+      <header class="modal-header"><div><p id="record-eyebrow" class="eyebrow"></p><h2 id="record-dialog-title"></h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <div id="record-fields" class="modal-body form-grid"></div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button id="save-record" class="button button-primary" type="submit"><span data-icon="check"></span>Save entry</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="backup-dialog" class="modal modal-small">
+    <form id="backup-form" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">Encrypted portability</p><h2>Backup &amp; restore</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <div class="modal-body stack">
+        <div class="callout"><span data-icon="shield"></span><p>Backups are encrypted envelopes. Keep the file and its passphrase safe.</p></div>
+        <div class="backup-choice"><div><strong>Export atlas</strong><p>Download an encrypted <code>.atlas.json</code> backup.</p></div><button id="export-button" class="button button-secondary" type="button">Export</button></div>
+        <div class="divider"><span>or restore</span></div>
+        <label class="field"><span>Encrypted backup file</span><input id="import-file" type="file" accept=".json,.atlas.json,application/json"></label>
+        <label class="field"><span>Backup passphrase</span><input id="backup-passphrase" type="password" autocomplete="off"></label>
+        <label class="check-row"><input id="import-confirm" type="checkbox"><span>I understand that importing may replace matching entries.</span></label>
+      </div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Close</button><button id="import-button" class="button button-primary" type="button" disabled><span data-icon="upload"></span>Import backup</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="secret-dialog" class="modal modal-small">
+    <form id="secret-form" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">Confirm encryption</p><h2 id="secret-title">Export backup</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <div class="modal-body stack"><p id="secret-copy" class="muted"></p><label class="field"><span>Passphrase</span><input id="secret-passphrase" type="password" autocomplete="off" required></label></div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Continue</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="link-dialog" class="modal modal-small">
+    <form id="link-form" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">Connect your atlas</p><h2>Add a cross-link</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <div class="modal-body stack">
+        <label class="field"><span>Entry</span><select id="link-target" required></select></label>
+        <label class="field"><span>Relationship label</span><input id="link-label" maxlength="80" placeholder="e.g. inspired by, supports" required></label>
+      </div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Add link</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="field-dialog" class="modal modal-small">
+    <form id="field-form" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">Your structure</p><h2>Add custom field</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <div class="modal-body form-grid">
+        <label class="field full"><span>Field name</span><input name="label" maxlength="60" required></label>
+        <label class="field"><span>Workspace</span><select name="category" required></select></label>
+        <label class="field"><span>Type</span><select name="fieldType"><option value="text">Text</option><option value="longText">Long text</option><option value="date">Partial date</option><option value="number">Number</option><option value="boolean">Yes / no</option><option value="url">URL</option><option value="singleChoice">Single choice</option></select></label>
+        <label id="field-options-row" class="field full" hidden><span>Choices</span><textarea name="options" placeholder="One choice per line"></textarea><small>Choices must be unique.</small></label>
+      </div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Add field</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="prompt-dialog" class="modal onboarding-modal">
+    <form id="prompt-form" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">A quiet beginning</p><h2>Place a few markers</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Skip prompts" data-icon="close"></button></header>
+      <div class="modal-body">
+        <p class="prompt-intro">Start with neutral placeholders and refine them whenever you like. Nothing here guesses who you are.</p>
+        <div id="prompt-options" class="prompt-options"></div>
+      </div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Skip for now</button><button class="button button-primary" type="submit">Add selected markers</button></footer>
+    </form>
+  </dialog>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>
