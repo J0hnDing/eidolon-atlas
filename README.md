@@ -52,14 +52,15 @@ This runs syntax checks and the focused Node test suite.
 
 ## Data safety
 
-Record contents, custom fields, and notes are encrypted at rest. Minimal
-structural metadata—IDs, categories, ordering, timestamps, and link topology—
-remains visible in the SQLite file. Restarting the server or choosing **Lock**
-removes the derived key from application memory.
+Record contents, custom fields, notes, and Experience image bytes are encrypted
+at rest. Minimal structural metadata, including attachment association and
+count, timestamps, and approximate attachment size, remains visible in SQLite.
+Restarting the server or choosing **Lock** removes the derived key from memory.
 
-Exports are versioned, independently encrypted `.atlas.json` documents. An
-import is fully decrypted and validated before it atomically replaces the
-current atlas.
+Exports are versioned `.atlas` files: backup v2 streams encrypted binary data
+and imports decrypt into a staged area without writing decrypted temporary
+images, then atomically replace the atlas. Backup v1 JSON envelopes remain
+import-compatible.
 
 See [Core model](docs/core-model.md), [Architecture](docs/architecture.md), and
 [Security](docs/security.md) for the product contracts and limitations.

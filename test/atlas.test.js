@@ -4,7 +4,7 @@ import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { Atlas } from '../src/atlas.js';
+import { Atlas, IMAGE_MAX_BYTES, IMAGE_MAX_PER_EXPERIENCE } from '../src/atlas.js';
 import { createBackupEnvelope, openBackupEnvelope } from '../src/crypto.js';
 import { createServer, listen } from '../src/server.js';
 
@@ -50,7 +50,7 @@ test('numbered migrations are idempotent across reopen', async (t) => {
   const first = new Atlas({ databasePath });
   await first.setup(APP_PASSPHRASE);
   assert.deepEqual(first.database.prepare('SELECT version FROM schema_migrations ORDER BY version').all()
-    .map((row) => row.version), [1, 2, 3]);
+    .map((row) => row.version), [1, 2, 3, 4]);
   first.close();
   const reopened = new Atlas({ databasePath });
   assert.deepEqual(reopened.status(), { initialized: true, locked: true });
@@ -144,6 +144,123 @@ test('typed custom fields and encrypted links are included in record detail', as
   }
 });
 
+test('person predefined fields validate without rejecting legacy-compatible data', async (t) => {
+  const { atlas } = await fixture(t);
+  const data = {
+    preferredName: 'Jo', gender: 'non-binary', birthDate: '1990-04', birthPlace: 'Toronto',
+    nationalities: ['Canadian', 'Irish'], languages: ['English', 'French'], maritalStatus: 'partnered',
+    emails: ['jo@example.test', 'work@example.test'], phoneNumbers: ['+1 555 0100'],
+    address: 'Private address', summary: 'A private portrait', notes: 'Profile note',
+    passportNumber: 'P-001', nationalIdNumber: 'N-002', driversLicenseNumber: 'D-003', taxIdNumber: 'T-004',
+    contact: '', status: '', futureCompatibleField: { retained: true },
+  };
+  const person = create(atlas, 'person', 'Jo Example', data);
+  assert.deepEqual(person.data.nationalities, ['Canadian', 'Irish']);
+  assert.equal(person.data.futureCompatibleField.retained, true);
+  assert.throws(() => atlas.patchRecord(person.id, { revision: person.revision, data: { ...data, birthDate: '1990-13' } }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => atlas.patchRecord(person.id, { revision: person.revision, data: { ...data, emails: ['valid@example.test', ''] } }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => atlas.patchRecord(person.id, { revision: person.revision, data: { ...data, languages: 'English' } }), { code: 'VALIDATION_ERROR' });
+});
+
+const PNG_PREFIX = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+function pngBytes(value = 'image') { return Buffer.concat([PNG_PREFIX, Buffer.from(value)]); }
+
+test('experience images are encrypted, bounded, trash-safe, and revision-independent', async (t) => {
+  const { atlas, databasePath } = await fixture(t);
+  const experience = create(atlas, 'experience', 'Gallery', { kind: 'event', startDate: '2026-08-05', narrative: 'Memory' });
+  const sentinel = 'IMAGE_PLAINTEXT_SENTINEL_43db';
+  const bytes = pngBytes(sentinel);
+  const image = atlas.createImage(experience.id, { filename: 'private-sentinel.png', mimeType: 'image/png', bytes });
+  assert.deepEqual(atlas.listImages(experience.id), [image]);
+  const content = atlas.getImageContent(image.id);
+  assert.deepEqual(content.bytes, bytes);
+  content.bytes.fill(0);
+  assert.equal(atlas.getRecord(experience.id).revision, experience.revision);
+  assert.throws(() => atlas.createImage(experience.id, { filename: 'wrong.png', mimeType: 'image/jpeg', bytes }), { code: 'IMAGE_TYPE_MISMATCH' });
+  assert.throws(() => atlas.createImage(experience.id, { filename: 'large.png', mimeType: 'image/png', bytes: Buffer.alloc(IMAGE_MAX_BYTES + 1) }), { code: 'VALIDATION_ERROR' });
+  const person = create(atlas, 'person', 'No gallery', {});
+  assert.throws(() => atlas.createImage(person.id, { filename: 'no.png', mimeType: 'image/png', bytes }), { code: 'IMAGES_REQUIRE_EXPERIENCE' });
+  atlas.trashRecord(experience.id, experience.revision);
+  assert.equal(atlas.listImages(experience.id).length, 1);
+  atlas.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  const databaseBytes = await readFile(databasePath);
+  assert.equal(databaseBytes.includes(Buffer.from(sentinel)), false);
+  assert.equal(databaseBytes.includes(Buffer.from('private-sentinel.png')), false);
+  assert.deepEqual(atlas.deleteImage(image.id), { deleted: true });
+  assert.equal(atlas.listImages(experience.id).length, 0);
+});
+
+test('experience image count limit is enforced with contiguous upload order', async (t) => {
+  const { atlas } = await fixture(t);
+  const experience = create(atlas, 'experience', 'Many images', { kind: 'event', startDate: '2026' });
+  for (let index = 0; index < IMAGE_MAX_PER_EXPERIENCE; index += 1) {
+    const image = atlas.createImage(experience.id, { filename: `${index}.png`, mimeType: 'image/png', bytes: pngBytes(String(index)) });
+    assert.equal(image.position, index);
+  }
+  assert.throws(() => atlas.createImage(experience.id, { filename: 'overflow.png', mimeType: 'image/png', bytes: pngBytes('overflow') }), { code: 'IMAGE_LIMIT_REACHED' });
+  const middle = atlas.listImages(experience.id)[20];
+  atlas.deleteImage(middle.id);
+  assert.deepEqual(atlas.listImages(experience.id).map((image) => image.position), Array.from({ length: IMAGE_MAX_PER_EXPERIENCE - 1 }, (_, index) => index));
+});
+
+test('experience image byte limit accepts the exact boundary', async (t) => {
+  const { atlas } = await fixture(t);
+  const experience = create(atlas, 'experience', 'Large original', { kind: 'event', startDate: '2026' });
+  const bytes = Buffer.alloc(IMAGE_MAX_BYTES);
+  PNG_PREFIX.copy(bytes);
+  const image = atlas.createImage(experience.id, { filename: 'large-original.png', mimeType: 'image/png', bytes });
+  assert.equal(image.byteLength, IMAGE_MAX_BYTES);
+  const content = atlas.getImageContent(image.id);
+  assert.equal(content.bytes.length, IMAGE_MAX_BYTES);
+  assert.deepEqual(content.bytes.subarray(0, PNG_PREFIX.length), PNG_PREFIX);
+  content.bytes.fill(0);
+});
+
+async function collect(source) {
+  const chunks = [];
+  for await (const chunk of source) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
+}
+
+test('streamed v2 backup round-trips images and rejects tampering atomically', async (t) => {
+  const source = await fixture(t);
+  const experience = create(source.atlas, 'experience', 'Portable gallery', { kind: 'event', startDate: '2026-08-05' });
+  const originalBytes = pngBytes('portable-image-content');
+  source.atlas.createImage(experience.id, { filename: 'portable.png', mimeType: 'image/png', bytes: originalBytes });
+  const exported = await source.atlas.exportV2(BACKUP_PASSPHRASE);
+  assert.equal(exported.contentType, 'application/vnd.eidolon-atlas-backup');
+  const backup = await collect(exported.stream);
+  assert.equal(backup.length, exported.byteLength);
+
+  const destination = await fixture(t);
+  const preserved = create(destination.atlas, 'preference', 'Preserved before import', { value: true });
+  const staged = await destination.atlas.stageImportUpload([backup]);
+  const result = await destination.atlas.commitImportUpload(staged.uploadId, BACKUP_PASSPHRASE);
+  assert.deepEqual(result, { imported: true, records: 1, images: 1 });
+  const imported = destination.atlas.listRecords({ category: 'experience' })[0];
+  const importedImage = destination.atlas.listImages(imported.id)[0];
+  const importedContent = destination.atlas.getImageContent(importedImage.id);
+  assert.deepEqual(importedContent.bytes, originalBytes);
+  importedContent.bytes.fill(0);
+  assert.throws(() => destination.atlas.listImages(preserved.id), { code: 'RECORD_NOT_FOUND' });
+
+  const keep = create(destination.atlas, 'preference', 'Keep after tamper', { value: 'unchanged' });
+  const tampered = Buffer.from(backup);
+  tampered[tampered.length - 20] ^= 0xff;
+  const badStage = await destination.atlas.stageImportUpload([tampered]);
+  await assert.rejects(destination.atlas.commitImportUpload(badStage.uploadId, BACKUP_PASSPHRASE), { code: 'INVALID_BACKUP_PASSPHRASE' });
+  assert.equal(destination.atlas.getRecord(keep.id).title, 'Keep after tamper');
+  await assert.rejects(destination.atlas.cancelImportUpload(badStage.uploadId), { code: 'IMPORT_UPLOAD_NOT_FOUND' });
+
+  const wrongStage = await destination.atlas.stageImportUpload([backup]);
+  await assert.rejects(destination.atlas.commitImportUpload(wrongStage.uploadId, 'incorrect backup passphrase'), { code: 'INVALID_BACKUP_PASSPHRASE' });
+  assert.equal(destination.atlas.getRecord(keep.id).title, 'Keep after tamper');
+
+  const truncatedStage = await destination.atlas.stageImportUpload([backup.subarray(0, -1)]);
+  await assert.rejects(destination.atlas.commitImportUpload(truncatedStage.uploadId, BACKUP_PASSPHRASE), { code: 'INVALID_BACKUP_PASSPHRASE' });
+  assert.equal(destination.atlas.getRecord(keep.id).title, 'Keep after tamper');
+});
+
 test('global search covers encrypted nested content without exposing trashed records by default', async (t) => {
   const { atlas } = await fixture(t);
   const first = create(atlas, 'preference', 'Editor', { value: { theme: 'Solarized Dark' } });
@@ -183,6 +300,60 @@ function rawRequest(port, { method = 'GET', path = '/', headers = {}, chunks = [
     req.end();
   });
 }
+
+test('HTTP image and streamed backup endpoints preserve binary contracts', async (t) => {
+  const { atlas, directory } = await fixture(t);
+  const publicDir = join(directory, 'public');
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(publicDir);
+  await writeFile(join(publicDir, 'index.html'), '<!doctype html><title>Atlas</title>');
+  const experience = create(atlas, 'experience', 'HTTP gallery', { kind: 'event', startDate: '2026-08-05' });
+  const server = createServer({ atlas, publicDir, uploadLimit: 4 * 1024 * 1024 });
+  const address = await listen(server, { port: 0 });
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
+  const port = address.port;
+  const bytes = pngBytes('http-image');
+  const uploaded = await rawRequest(port, {
+    method: 'POST', path: `/api/records/${experience.id}/images`,
+    headers: { 'content-type': 'image/png', 'x-atlas-filename': encodeURIComponent('HTTP image.png') }, chunks: [bytes],
+  });
+  assert.equal(uploaded.status, 201);
+  const image = JSON.parse(uploaded.body);
+  assert.equal(image.filename, 'HTTP image.png');
+  const listed = await rawRequest(port, { path: `/api/records/${experience.id}/images` });
+  assert.deepEqual(JSON.parse(listed.body).map((item) => item.id), [image.id]);
+  const content = await rawRequest(port, { path: `/api/images/${image.id}/content` });
+  assert.equal(content.status, 200);
+  assert.equal(content.headers['content-type'], 'image/png');
+  assert.equal(content.headers['cache-control'], 'no-store');
+  assert.deepEqual(content.body, bytes);
+
+  const exported = await rawRequest(port, {
+    method: 'POST', path: '/api/export', headers: { 'content-type': 'application/json' },
+    chunks: [Buffer.from(JSON.stringify({ passphrase: BACKUP_PASSPHRASE }))],
+  });
+  assert.equal(exported.status, 200);
+  assert.equal(exported.headers['content-type'], 'application/vnd.eidolon-atlas-backup');
+  assert.match(exported.headers['content-disposition'], /\.atlas"$/);
+
+  const staged = await rawRequest(port, {
+    method: 'POST', path: '/api/import-uploads', headers: { 'content-type': 'application/vnd.eidolon-atlas-backup' }, chunks: [exported.body],
+  });
+  assert.equal(staged.status, 201);
+  const uploadId = JSON.parse(staged.body).uploadId;
+  const committed = await rawRequest(port, {
+    method: 'POST', path: `/api/import-uploads/${uploadId}/commit`, headers: { 'content-type': 'application/json' },
+    chunks: [Buffer.from(JSON.stringify({ passphrase: BACKUP_PASSPHRASE }))],
+  });
+  assert.equal(committed.status, 200);
+  assert.deepEqual(JSON.parse(committed.body), { imported: true, records: 1, images: 1 });
+  const deepLink = await rawRequest(port, { path: `/experiences/${experience.id}` });
+  assert.equal(deepLink.status, 200);
+
+  const deleted = await rawRequest(port, { method: 'DELETE', path: `/api/images/${image.id}` });
+  assert.equal(deleted.status, 200);
+  assert.deepEqual(JSON.parse(deleted.body), { deleted: true });
+});
 
 test('HTTP buffers split UTF-8, applies limits, stable errors, lock status, and SPA serving', async (t) => {
   const { atlas, directory } = await fixture(t);

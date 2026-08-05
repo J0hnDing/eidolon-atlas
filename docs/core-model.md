@@ -10,15 +10,19 @@ custom fields.
 ### Person
 
 There is at most one Person record: the atlas owner's profile. It holds their
-name, summary, contact details, address information, and flexible status notes;
-dates can be included where their history matters. Other people and
-organizations belong in Relationships.
+name, summary, repeatable contact methods, languages, nationalities, address
+information, and profile notes. Sensitive government identifiers are
+kept in a collapsed section rather than mixed into the everyday profile. Dates
+can be included where their history matters. Other people and organizations
+belong in Relationships.
 
 ### Experience
 
 An Experience is an event or period on the owner's timeline. Dates may be a
 year, year and month, or complete date so the user never has to invent
-precision. Experiences can be ongoing and link to any other record.
+precision. Experiences can be ongoing and link to any other record. Experiences
+may also carry encrypted JPEG, PNG, or WebP images, up to 20 MiB per image and
+50 images per Experience.
 
 ### Goal
 
@@ -69,6 +73,16 @@ edits do not create revisions.
 Trashing is reversible. A goal with active subgoals cannot be trashed until
 those children are moved or trashed. Links remain associated with a trashed
 record and become visible again if it is restored.
+
+Experience attachments are independent of record revisions: adding or removing
+an image does not create a record revision. Attachments remain available while
+their Experience is in trash and return when it is restored.
+
+## Navigation
+
+Experience, Goal, Project, Resource, and Relationship records open on routed
+full-page detail views. Person and Preference records continue to use the
+workspace drawer.
 
 ## Dates
 

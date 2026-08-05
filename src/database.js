@@ -66,6 +66,22 @@ const MIGRATIONS = [
     version: 3,
     sql: `ALTER TABLE custom_fields ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1));`,
   },
+  {
+    version: 4,
+    sql: `
+      CREATE TABLE record_images (
+        id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL,
+        position INTEGER NOT NULL CHECK (position >= 0),
+        created_at TEXT NOT NULL,
+        metadata TEXT NOT NULL,
+        content BLOB NOT NULL,
+        UNIQUE (record_id, position),
+        FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+      ) STRICT;
+      CREATE INDEX record_images_record ON record_images(record_id, position);
+    `,
+  },
 ];
 
 export function openDatabase(path = 'data/atlas.sqlite') {

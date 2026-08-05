@@ -1,8 +1,13 @@
+import { createReadStream, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { open, rm, writeFile } from 'node:fs/promises';
+import { resolve, join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { openDatabase, transaction } from './database.js';
 import {
-  DEFAULT_KDF, createBackupEnvelope, decryptJson, deriveKey, encryptJson, makeKeyCheck,
-  objectAad, openBackupEnvelope, verifyKeyCheck,
+  BACKUP_V2_MAGIC, BACKUP_V2_MAX_HEADER_BYTES, BACKUP_V2_MAX_MANIFEST_BYTES, DEFAULT_KDF, createBackupEnvelope,
+  createBackupV2Decipher, createBackupV2Stream, decryptBinary, decryptJson, deriveKey,
+  encryptBinary, encryptJson, makeKeyCheck, objectAad, openBackupEnvelope, verifyKeyCheck,
 } from './crypto.js';
 import {
   CATEGORIES, canonicalJson, normalizeCustomField, normalizeLink, normalizeRecord,
@@ -12,6 +17,11 @@ import { AtlasError, fail } from './errors.js';
 
 const KEY_CONFIG = 'encryption-config';
 const KEY_CHECK = 'key-check';
+export const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+export const IMAGE_MAX_PER_EXPERIENCE = 50;
+export const BACKUP_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
+const UPLOAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function now() { return new Date().toISOString(); }
 function integerPosition(value) {
@@ -20,19 +30,45 @@ function integerPosition(value) {
   return value;
 }
 
+function imageType(bytes) {
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
+  if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
+  if (bytes.length >= 12 && bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+  return null;
+}
+
+function validateImageMetadata({ filename, mimeType, byteLength }, { backup = false } = {}) {
+  const invalid = (message) => fail(backup ? 400 : 400, backup ? 'INVALID_BACKUP' : 'VALIDATION_ERROR', message);
+  if (typeof filename !== 'string' || filename.trim() === '' || Buffer.byteLength(filename, 'utf8') > 1024 || /[\u0000\r\n]/.test(filename)) {
+    invalid(backup ? 'An image filename is invalid.' : 'Image filename must be a non-empty string of at most 1024 bytes.');
+  }
+  if (!IMAGE_MIME_TYPES.has(mimeType)) invalid(backup ? 'An image MIME type is invalid.' : 'Only JPEG, PNG, and WebP images are supported.');
+  if (!Number.isInteger(byteLength) || byteLength < 1 || byteLength > IMAGE_MAX_BYTES) {
+    invalid(backup ? 'An image byte length is invalid.' : `Image content must be between 1 and ${IMAGE_MAX_BYTES} bytes.`);
+  }
+}
+
 export class Atlas {
   #db;
   #key = null;
   #closed = false;
+  #stagingDir;
+  #uploads = new Map();
 
   constructor({ databasePath = 'data/atlas.sqlite' } = {}) {
     this.#db = openDatabase(databasePath);
+    this.#stagingDir = databasePath === ':memory:'
+      ? join(tmpdir(), `eidolon-atlas-imports-${randomUUID()}`)
+      : `${resolve(databasePath)}.imports`;
+    rmSync(this.#stagingDir, { recursive: true, force: true });
+    mkdirSync(this.#stagingDir, { recursive: true });
   }
 
   close() {
     if (this.#closed) return;
     this.lock();
     this.#db.close();
+    rmSync(this.#stagingDir, { recursive: true, force: true });
     this.#closed = true;
   }
 
@@ -376,32 +412,175 @@ export class Atlas {
     return { deleted: true };
   }
 
+  listImages(recordId) {
+    this.#requireUnlocked();
+    this.#experienceRow(recordId);
+    return this.#db.prepare('SELECT * FROM record_images WHERE record_id = ? ORDER BY position, created_at, id')
+      .all(recordId).map((row) => this.#imageFromRow(row));
+  }
+
+  createImage(recordId, { filename, mimeType, bytes }) {
+    this.#requireUnlocked();
+    this.#experienceRow(recordId);
+    if (!Buffer.isBuffer(bytes)) fail(400, 'VALIDATION_ERROR', 'Image content must be binary.');
+    validateImageMetadata({ filename, mimeType, byteLength: bytes.length });
+    if (imageType(bytes) !== mimeType) fail(415, 'IMAGE_TYPE_MISMATCH', 'Image bytes do not match the declared Content-Type.');
+    const count = this.#db.prepare('SELECT COUNT(*) AS count FROM record_images WHERE record_id = ?').get(recordId).count;
+    if (count >= IMAGE_MAX_PER_EXPERIENCE) {
+      fail(409, 'IMAGE_LIMIT_REACHED', `An experience can have at most ${IMAGE_MAX_PER_EXPERIENCE} images.`);
+    }
+    const id = randomUUID();
+    const createdAt = now();
+    const metadata = encryptJson(this.#key, { filename, mimeType, byteLength: bytes.length },
+      objectAad('image-metadata', id, 1, recordId));
+    const content = encryptBinary(this.#key, bytes, objectAad('image-content', id, 1, recordId));
+    this.#db.prepare(`INSERT INTO record_images(id, record_id, position, created_at, metadata, content)
+      VALUES (?, ?, ?, ?, ?, ?)`).run(id, recordId, count, createdAt, metadata, content);
+    return this.#imageFromRow(this.#imageRow(id));
+  }
+
+  getImageContent(id) {
+    this.#requireUnlocked();
+    const row = this.#imageRow(id);
+    const metadata = this.#imageFromRow(row);
+    const bytes = decryptBinary(this.#key, row.content, objectAad('image-content', id, 1, row.record_id));
+    if (bytes.length !== metadata.byteLength || imageType(bytes) !== metadata.mimeType) {
+      bytes.fill(0);
+      fail(422, 'DATA_INTEGRITY_ERROR', 'Encrypted image content does not match its authenticated metadata.');
+    }
+    return { metadata, bytes };
+  }
+
+  deleteImage(id) {
+    this.#requireUnlocked();
+    const row = this.#imageRow(id);
+    transaction(this.#db, () => {
+      this.#db.prepare('DELETE FROM record_images WHERE id = ?').run(id);
+      this.#db.prepare('UPDATE record_images SET position = position - 1 WHERE record_id = ? AND position > ?')
+        .run(row.record_id, row.position);
+    });
+    return { deleted: true };
+  }
+
   async export(passphrase) {
     this.#requireUnlocked();
-    const records = this.#db.prepare('SELECT * FROM records ORDER BY created_at, id').all().map((row) => this.#recordFromRow(row));
-    const revisions = this.#db.prepare('SELECT * FROM record_revisions ORDER BY record_id, revision').all().map((row) => ({
-      recordId: row.record_id,
-      revision: row.revision,
-      category: row.category,
-      createdAt: row.created_at,
-      snapshot: decryptJson(this.#key, row.payload, objectAad('revision', row.record_id, row.revision, row.category)),
-    }));
-    const snapshot = {
-      format: 'eidolon-atlas-snapshot', version: 1, exportedAt: now(),
-      records: records.map(({ links, backlinks, ...record }) => record),
-      revisions,
-      customFields: this.listCustomFields(),
-      links: this.#db.prepare('SELECT * FROM links ORDER BY created_at, id').all().map((row) => this.#linkFromRow(row)),
+    return createBackupEnvelope(passphrase, this.#exportSnapshot());
+  }
+
+  async exportV2(passphrase) {
+    this.#requireUnlocked();
+    const snapshot = this.#exportSnapshot();
+    const rows = this.#db.prepare('SELECT * FROM record_images ORDER BY record_id, position, created_at, id').all();
+    const images = rows.map((row) => this.#imageFromRow(row));
+    const manifest = Buffer.from(JSON.stringify({
+      format: 'eidolon-atlas-archive', version: 2, snapshot, images,
+    }), 'utf8');
+    if (manifest.length > BACKUP_V2_MAX_MANIFEST_BYTES) fail(413, 'BACKUP_TOO_LARGE', 'The backup manifest is too large.');
+    const prefix = Buffer.allocUnsafe(4);
+    prefix.writeUInt32BE(manifest.length);
+    const plaintextLength = 4 + manifest.length + images.reduce((total, image) => total + image.byteLength, 0);
+    const key = Buffer.from(this.#key);
+    const plaintext = async function* () {
+      try {
+        yield prefix;
+        yield manifest;
+        for (let index = 0; index < rows.length; index += 1) {
+          const row = rows[index];
+          const bytes = decryptBinary(key, row.content, objectAad('image-content', row.id, 1, row.record_id));
+          try {
+            const metadata = images[index];
+            if (bytes.length !== metadata.byteLength || imageType(bytes) !== metadata.mimeType) {
+              fail(422, 'DATA_INTEGRITY_ERROR', 'Encrypted image content does not match its authenticated metadata.');
+            }
+            yield bytes;
+          } finally {
+            bytes.fill(0);
+          }
+        }
+      } finally {
+        key.fill(0);
+      }
     };
-    return createBackupEnvelope(passphrase, snapshot);
+    let result;
+    try {
+      result = await createBackupV2Stream(passphrase, plaintextLength, plaintext());
+    } catch (error) {
+      key.fill(0);
+      throw error;
+    }
+    return {
+      ...result,
+      contentType: 'application/vnd.eidolon-atlas-backup',
+      filename: `eidolon-atlas-${now().slice(0, 10)}.atlas`,
+    };
+  }
+
+  async stageImportUpload(source, { maxBytes = BACKUP_UPLOAD_MAX_BYTES } = {}) {
+    this.#requireUnlocked();
+    const id = randomUUID();
+    const path = this.#uploadPath(id);
+    const handle = await open(path, 'wx', 0o600);
+    let byteLength = 0;
+    try {
+      for await (const value of source) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        byteLength += chunk.length;
+        if (byteLength > maxBytes) fail(413, 'REQUEST_TOO_LARGE', `Backup upload exceeds the ${maxBytes}-byte limit.`);
+        let offset = 0;
+        while (offset < chunk.length) {
+          const { bytesWritten } = await handle.write(chunk, offset, chunk.length - offset);
+          if (bytesWritten <= 0) throw new Error('Backup staging write made no progress.');
+          offset += bytesWritten;
+        }
+      }
+      if (byteLength === 0) fail(400, 'INVALID_BACKUP', 'The backup upload is empty.');
+      await handle.sync();
+    } catch (error) {
+      await handle.close().catch(() => {});
+      await rm(path, { force: true }).catch(() => {});
+      throw error;
+    }
+    await handle.close();
+    this.#uploads.set(id, byteLength);
+    return { uploadId: id, byteLength };
+  }
+
+  async cancelImportUpload(id) {
+    this.#requireUnlocked();
+    this.#requireUpload(id);
+    this.#uploads.delete(id);
+    await rm(this.#uploadPath(id), { force: true });
+    return { deleted: true };
+  }
+
+  async commitImportUpload(id, passphrase) {
+    this.#requireUnlocked();
+    this.#requireUpload(id);
+    const path = this.#uploadPath(id);
+    const stagedImages = [];
+    try {
+      const { prepared, images } = await this.#openV2Upload(path, passphrase, stagedImages);
+      this.#replaceSnapshot(prepared, images);
+      return { imported: true, records: prepared.records.length, images: images.length };
+    } finally {
+      this.#uploads.delete(id);
+      await rm(path, { force: true }).catch(() => {});
+      await Promise.all(stagedImages.map((image) => rm(image.path, { force: true }).catch(() => {})));
+    }
   }
 
   async import(passphrase, envelope) {
     this.#requireUnlocked();
     const snapshot = await openBackupEnvelope(passphrase, envelope);
     const prepared = this.#validateSnapshot(snapshot);
+    this.#replaceSnapshot(prepared, []);
+    return { imported: true, records: prepared.records.length };
+  }
+
+  #replaceSnapshot(prepared, images) {
+    this.#requireUnlocked();
     transaction(this.#db, () => {
-      this.#db.exec('DELETE FROM links; DELETE FROM record_revisions; DELETE FROM records; DELETE FROM custom_fields;');
+      this.#db.exec('DELETE FROM record_images; DELETE FROM links; DELETE FROM record_revisions; DELETE FROM records; DELETE FROM custom_fields;');
       for (const field of prepared.customFields) {
         this.#db.prepare(`INSERT INTO custom_fields(id, category, type, created_at, updated_at, payload, archived)
           VALUES (?, ?, ?, ?, ?, ?, ?)`).run(field.id, field.category, field.type, field.createdAt, field.updatedAt,
@@ -424,8 +603,222 @@ export class Atlas {
           VALUES (?, ?, ?, ?, ?, ?)`).run(link.id, link.sourceId, link.targetId, link.createdAt, link.updatedAt,
           encryptJson(this.#key, { type: link.type, label: link.label, notes: link.notes }, objectAad('link', link.id, 1, 'link')));
       }
+      for (const image of images) {
+        const content = readFileSync(image.path);
+        try {
+          this.#db.prepare(`INSERT INTO record_images(id, record_id, position, created_at, metadata, content)
+            VALUES (?, ?, ?, ?, ?, ?)`).run(image.id, image.recordId, image.position, image.createdAt,
+            encryptJson(this.#key, { filename: image.filename, mimeType: image.mimeType, byteLength: image.byteLength },
+              objectAad('image-metadata', image.id, 1, image.recordId)), content);
+        } finally {
+          content.fill(0);
+        }
+      }
     });
-    return { imported: true, records: prepared.records.length };
+  }
+
+  #exportSnapshot() {
+    const records = this.#db.prepare('SELECT * FROM records ORDER BY created_at, id').all().map((row) => this.#recordFromRow(row));
+    const revisions = this.#db.prepare('SELECT * FROM record_revisions ORDER BY record_id, revision').all().map((row) => ({
+      recordId: row.record_id,
+      revision: row.revision,
+      category: row.category,
+      createdAt: row.created_at,
+      snapshot: decryptJson(this.#key, row.payload, objectAad('revision', row.record_id, row.revision, row.category)),
+    }));
+    return {
+      format: 'eidolon-atlas-snapshot', version: 1, exportedAt: now(),
+      records: records.map(({ links, backlinks, ...record }) => record),
+      revisions,
+      customFields: this.listCustomFields(),
+      links: this.#db.prepare('SELECT * FROM links ORDER BY created_at, id').all().map((row) => this.#linkFromRow(row)),
+    };
+  }
+
+  async #openV2Upload(path, passphrase, stagedImages) {
+    const handle = await open(path, 'r');
+    let size;
+    let prefix;
+    let tag;
+    try {
+      size = (await handle.stat()).size;
+      const preludeLength = BACKUP_V2_MAGIC.length + 4;
+      if (size < preludeLength + 2 + 16) fail(400, 'INVALID_BACKUP', 'The v2 backup is truncated.');
+      const prelude = Buffer.alloc(preludeLength);
+      if ((await handle.read(prelude, 0, prelude.length, 0)).bytesRead !== prelude.length ||
+          !prelude.subarray(0, BACKUP_V2_MAGIC.length).equals(BACKUP_V2_MAGIC)) {
+        fail(400, 'INVALID_BACKUP', 'The backup is not a supported v2 container.');
+      }
+      const headerLength = prelude.readUInt32BE(BACKUP_V2_MAGIC.length);
+      if (headerLength < 2 || headerLength > BACKUP_V2_MAX_HEADER_BYTES || size < preludeLength + headerLength + 16 + 4) {
+        fail(400, 'INVALID_BACKUP', 'The v2 backup header is invalid or the backup is truncated.');
+      }
+      prefix = Buffer.alloc(preludeLength + headerLength);
+      prelude.copy(prefix);
+      if ((await handle.read(prefix, preludeLength, headerLength, preludeLength)).bytesRead !== headerLength) {
+        fail(400, 'INVALID_BACKUP', 'The v2 backup header is truncated.');
+      }
+      tag = Buffer.alloc(16);
+      if ((await handle.read(tag, 0, 16, size - 16)).bytesRead !== 16) fail(400, 'INVALID_BACKUP', 'The v2 backup tag is truncated.');
+    } finally {
+      await handle.close();
+    }
+
+    const { decipher, key, tagBytes } = await createBackupV2Decipher(passphrase, prefix);
+    decipher.setAuthTag(tag);
+    const localKey = Buffer.from(this.#key);
+    let prepared;
+    let images;
+    let lengthBytes = Buffer.alloc(4);
+    let lengthSeen = 0;
+    let manifestLength;
+    let manifestSeen = 0;
+    let manifestChunks = [];
+    let imageIndex = 0;
+    let imageSeen = 0;
+    let imageChunks = [];
+    let parseError;
+
+    const finishImage = async () => {
+      const metadata = images[imageIndex];
+      const bytes = Buffer.concat(imageChunks, imageSeen);
+      imageChunks = [];
+      imageSeen = 0;
+      try {
+        if (bytes.length !== metadata.byteLength || imageType(bytes) !== metadata.mimeType) {
+          fail(400, 'INVALID_BACKUP', 'Backup image bytes do not match their authenticated metadata.');
+        }
+        const encrypted = encryptBinary(localKey, bytes,
+          objectAad('image-content', metadata.id, 1, metadata.recordId));
+        const imagePath = join(this.#stagingDir, `image-${randomUUID()}.encrypted`);
+        try {
+          await writeFile(imagePath, encrypted, { flag: 'wx', mode: 0o600 });
+          stagedImages.push({ ...metadata, path: imagePath });
+        } finally {
+          encrypted.fill(0);
+        }
+      } finally {
+        bytes.fill(0);
+      }
+      imageIndex += 1;
+    };
+
+    const consume = async (plaintext) => {
+      let offset = 0;
+      while (offset < plaintext.length) {
+        if (lengthSeen < 4) {
+          const take = Math.min(4 - lengthSeen, plaintext.length - offset);
+          plaintext.copy(lengthBytes, lengthSeen, offset, offset + take);
+          lengthSeen += take;
+          offset += take;
+          if (lengthSeen === 4) {
+            manifestLength = lengthBytes.readUInt32BE(0);
+            if (manifestLength < 2 || manifestLength > BACKUP_V2_MAX_MANIFEST_BYTES) {
+              fail(400, 'INVALID_BACKUP', 'The v2 backup manifest length is invalid.');
+            }
+          }
+          continue;
+        }
+        if (manifestSeen < manifestLength) {
+          const take = Math.min(manifestLength - manifestSeen, plaintext.length - offset);
+          manifestChunks.push(Buffer.from(plaintext.subarray(offset, offset + take)));
+          manifestSeen += take;
+          offset += take;
+          if (manifestSeen === manifestLength) {
+            const manifestBytes = Buffer.concat(manifestChunks, manifestLength);
+            manifestChunks = [];
+            let manifest;
+            try {
+              manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(manifestBytes));
+            } catch {
+              fail(400, 'INVALID_BACKUP', 'The v2 backup manifest is invalid.');
+            } finally {
+              manifestBytes.fill(0);
+            }
+            ({ prepared, images } = this.#validateV2Manifest(manifest));
+          }
+          continue;
+        }
+        if (imageIndex >= images.length) fail(400, 'INVALID_BACKUP', 'The v2 backup contains trailing plaintext.');
+        const remaining = images[imageIndex].byteLength - imageSeen;
+        const take = Math.min(remaining, plaintext.length - offset);
+        imageChunks.push(Buffer.from(plaintext.subarray(offset, offset + take)));
+        imageSeen += take;
+        offset += take;
+        if (imageSeen === images[imageIndex].byteLength) await finishImage();
+      }
+    };
+
+    try {
+      const ciphertextEnd = size - tagBytes - 1;
+      for await (const chunk of createReadStream(path, { start: prefix.length, end: ciphertextEnd })) {
+        const plaintext = decipher.update(chunk);
+        try {
+          if (!parseError) await consume(plaintext);
+        } catch (error) {
+          parseError = error;
+        } finally {
+          plaintext.fill(0);
+        }
+      }
+      let final;
+      try {
+        final = decipher.final();
+      } catch {
+        fail(401, 'INVALID_BACKUP_PASSPHRASE', 'The backup passphrase is incorrect or the backup was modified.');
+      }
+      try {
+        if (!parseError) await consume(final);
+      } catch (error) {
+        parseError = error;
+      } finally {
+        final.fill(0);
+      }
+      if (parseError) throw parseError;
+      if (!prepared || imageIndex !== images.length || imageSeen !== 0) {
+        fail(400, 'INVALID_BACKUP', 'The v2 backup archive is truncated.');
+      }
+      return { prepared, images: stagedImages };
+    } finally {
+      key.fill(0);
+      localKey.fill(0);
+      lengthBytes.fill(0);
+      for (const chunk of manifestChunks) chunk.fill(0);
+      for (const chunk of imageChunks) chunk.fill(0);
+    }
+  }
+
+  #validateV2Manifest(manifest) {
+    if (!manifest || manifest.format !== 'eidolon-atlas-archive' || manifest.version !== 2 || !Array.isArray(manifest.images)) {
+      fail(400, 'INVALID_BACKUP', 'The v2 backup manifest is invalid or unsupported.');
+    }
+    const prepared = this.#validateSnapshot(manifest.snapshot);
+    const records = new Map(prepared.records.map((record) => [record.id, record]));
+    const ids = new Set();
+    const groups = new Map();
+    const images = manifest.images.map((image) => {
+      if (!image || typeof image.id !== 'string' || image.id === '' || ids.has(image.id) ||
+          typeof image.recordId !== 'string' || typeof image.createdAt !== 'string') {
+        fail(400, 'INVALID_BACKUP', 'An image has invalid structural metadata.');
+      }
+      ids.add(image.id);
+      const record = records.get(image.recordId);
+      if (!record || record.category !== 'experience') fail(400, 'INVALID_BACKUP', 'An image must belong to an Experience record.');
+      validateImageMetadata(image, { backup: true });
+      const position = integerPosition(image.position);
+      if (position === undefined) fail(400, 'INVALID_BACKUP', 'An image position is invalid.');
+      if (!groups.has(image.recordId)) groups.set(image.recordId, []);
+      groups.get(image.recordId).push(position);
+      return { id: image.id, recordId: image.recordId, position, createdAt: image.createdAt,
+        filename: image.filename, mimeType: image.mimeType, byteLength: image.byteLength };
+    });
+    for (const positions of groups.values()) {
+      positions.sort((left, right) => left - right);
+      if (positions.length > IMAGE_MAX_PER_EXPERIENCE || positions.some((position, index) => position !== index)) {
+        fail(400, 'INVALID_BACKUP', 'Experience images must have unique contiguous positions within the image limit.');
+      }
+    }
+    return { prepared, images };
   }
 
   #validateSnapshot(snapshot) {
@@ -628,6 +1021,36 @@ export class Atlas {
     const row = this.#db.prepare('SELECT * FROM records WHERE id = ?').get(id);
     if (!row) fail(404, 'RECORD_NOT_FOUND', 'Record not found.');
     return row;
+  }
+
+  #experienceRow(id) {
+    const row = this.#recordRow(id);
+    if (row.category !== 'experience') fail(400, 'IMAGES_REQUIRE_EXPERIENCE', 'Images can only be attached to Experience records.');
+    return row;
+  }
+
+  #imageRow(id) {
+    const row = this.#db.prepare('SELECT * FROM record_images WHERE id = ?').get(id);
+    if (!row) fail(404, 'IMAGE_NOT_FOUND', 'Image not found.');
+    return row;
+  }
+
+  #imageFromRow(row) {
+    const value = decryptJson(this.#key, row.metadata,
+      objectAad('image-metadata', row.id, 1, row.record_id));
+    validateImageMetadata(value);
+    return { id: row.id, recordId: row.record_id, position: row.position, createdAt: row.created_at,
+      filename: value.filename, mimeType: value.mimeType, byteLength: value.byteLength };
+  }
+
+  #uploadPath(id) {
+    return join(this.#stagingDir, `${id}.upload`);
+  }
+
+  #requireUpload(id) {
+    if (typeof id !== 'string' || !UPLOAD_ID.test(id) || !this.#uploads.has(id)) {
+      fail(404, 'IMPORT_UPLOAD_NOT_FOUND', 'Import upload not found.');
+    }
   }
 
   #validateCustomValues(category, values, { existingValues = {} } = {}) {

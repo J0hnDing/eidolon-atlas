@@ -12,11 +12,19 @@ const CATEGORIES = {
 
 const FIELD_DEFS = {
   person: [
-    ["title", "Name", "text", true, "Your name"],
-    ["summary", "Summary", "textarea", false, "A concise portrait, in your own words"],
-    ["contact", "Contact details", "textarea", false, "One item per line"],
+    ["title", "Legal name", "text", true, "Your legal name"],
+    ["preferredName", "Preferred name", "text", false, "What should the atlas call you?"],
+    ["gender", "Gender", "text", false, "How you describe your gender"],
+    ["birthDate", "Birth date", "partial", false, "YYYY, YYYY-MM, or YYYY-MM-DD"],
+    ["birthPlace", "Birth place", "text", false, "City, region, or country"],
+    ["nationalities", "Nationalities", "repeatable", false, "Add each nationality"],
+    ["languages", "Languages", "repeatable", false, "Add each language"],
+    ["maritalStatus", "Marital status", "text", false, "Optional context"],
+    ["emails", "Email addresses", "repeatableEmail", false, "name@example.com"],
+    ["phoneNumbers", "Phone numbers", "repeatable", false, "Add each number"],
     ["address", "Address", "textarea", false, "A current address or concise address history"],
-    ["status", "Current status", "textarea", false, "Roles, seasons, or other date-bounded statuses"]
+    ["summary", "Summary", "textarea", false, "A concise portrait, in your own words"],
+    ["notes", "Notes", "textarea", false, "Private notes about this profile"]
   ],
   experience: [
     ["title", "Experience", "text", true, "What happened or what was this chapter?"],
@@ -108,6 +116,25 @@ const ICONS = {
   upload: ["M12 16V4m-4 4 4-4 4 4", "M4 15v5h16v-5"]
 };
 
+const LEGACY_PERSON_KEYS = new Set(["contact", "status"]);
+const PERSON_SENSITIVE_KEYS = new Set(["passportNumber", "nationalIdNumber", "driversLicenseNumber", "taxIdNumber"]);
+const PERSON_SENSITIVE_DEFS = [
+  ["passportNumber", "Passport number", "text", false, "Optional"],
+  ["nationalIdNumber", "National ID number", "text", false, "Optional"],
+  ["driversLicenseNumber", "Driver's licence number", "text", false, "Optional"],
+  ["taxIdNumber", "Tax ID number", "text", false, "Optional"]
+];
+const PERSON_PROFILE_GROUPS = [
+  ["Personal information", ["preferredName", "gender", "birthDate", "birthPlace", "maritalStatus"]],
+  ["Nationality & language", ["nationalities", "languages"]],
+  ["Contact", ["emails", "phoneNumbers", "address"]],
+  ["About", ["summary", "notes"]]
+];
+const PERSON_KEYS = new Set(FIELD_DEFS.person.map(([key]) => key).filter((key) => key !== "title").concat([...PERSON_SENSITIVE_KEYS]));
+const FULL_PAGE_CATEGORIES = new Set(["experience", "goal", "project", "resource", "relationship"]);
+const ROUTE_PLURALS = { person: "person", experience: "experiences", goal: "goals", project: "projects", resource: "resources", relationship: "relationships", preference: "preferences" };
+const ROUTE_SINGULARS = Object.fromEntries(Object.entries(ROUTE_PLURALS).map(([key, value]) => [value, key]));
+
 const state = {
   category: "person",
   records: [],
@@ -121,7 +148,11 @@ const state = {
   query: "",
   trash: false,
   loading: false,
-  loadToken: 0
+  loadToken: 0,
+  route: null,
+  detailMode: null,
+  gallery: { recordId: null, images: [], loading: false },
+  lightboxIndex: -1
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -196,6 +227,20 @@ async function api(path, options = {}) {
   return payload;
 }
 
+async function rawApi(path, options = {}) {
+  const headers = { Accept: options.accept || "application/json", ...(options.headers || {}) };
+  const response = await fetch(`/api${path}`, { method: options.method || "GET", headers, body: options.body });
+  if (!response.ok) {
+    let payload = null;
+    try { payload = (response.headers.get("content-type") || "").includes("json") ? await response.json() : await response.text(); } catch { /* best effort */ }
+    const error = new Error(errorMessage(payload, `Request failed (${response.status})`));
+    error.status = response.status;
+    error.payload = payload;
+    throw error;
+  }
+  return response;
+}
+
 function listPayload(payload, key) {
   if (Array.isArray(payload)) return payload;
   if (Array.isArray(payload?.[key])) return payload[key];
@@ -203,11 +248,31 @@ function listPayload(payload, key) {
   return [];
 }
 
-function recordPayload(payload) { return payload?.record || payload; }
+function recordPayload(payload) { return normalizedRecord(payload?.record || payload); }
 function recordTitle(record) { return record?.title || "Untitled entry"; }
 function recordSummary(record) {
   const data = record?.data || {};
-  return data.summary || data.narrative || data.currentState || data.context || data.progressNote || data.motivation || data.notes || data.value || data.relationshipType || data.location || "";
+  return data.summary || data.narrative || data.currentState || data.context || data.progressNote || data.motivation || data.notes || data.value || data.relationshipType || data.location || data.preferredName || "";
+}
+
+function personData(recordOrData) {
+  const source = recordOrData?.data || recordOrData || {};
+  const data = {};
+  PERSON_KEYS.forEach((key) => {
+    if (LEGACY_PERSON_KEYS.has(key)) return;
+    if (source[key] === undefined || source[key] === null) return;
+    if (["nationalities", "languages", "emails", "phoneNumbers"].includes(key)) {
+      const values = Array.isArray(source[key]) ? source[key] : String(source[key]).split(/\r?\n/);
+      const cleaned = values.map((value) => String(value).trim()).filter(Boolean);
+      if (cleaned.length) data[key] = cleaned;
+    } else if (String(source[key]).trim() !== "") data[key] = String(source[key]).trim();
+  });
+  return data;
+}
+
+function normalizedRecord(record) {
+  if (!record || record.category !== "person") return record;
+  return { ...record, data: personData(record) };
 }
 
 function friendly(value) {
@@ -284,7 +349,8 @@ async function initialize() {
 async function enterAtlas({ prompt = false } = {}) {
   $("#auth-view").hidden = true;
   $("#app").hidden = false;
-  await Promise.all([refreshCounts(), loadCategory()]);
+  await refreshCounts();
+  await applyRoute(routeFromLocation());
   if (prompt) openPromptDialog();
 }
 
@@ -303,7 +369,7 @@ function buildNavigation() {
 async function refreshCounts() {
   try {
     const [activePayload, trashPayload] = await Promise.all([api("/records?trashed=false"), api("/records?trashed=true")]);
-    state.allRecords = listPayload(activePayload, "records");
+    state.allRecords = listPayload(activePayload, "records").map(normalizedRecord);
     const counts = Object.fromEntries(Object.keys(CATEGORIES).map((key) => [key, 0]));
     state.allRecords.forEach((record) => { if (record.category in counts) counts[record.category] += 1; });
     Object.entries(counts).forEach(([key, count]) => { const node = $(`[data-count="${key}"]`); if (node) node.textContent = String(count); });
@@ -314,14 +380,79 @@ async function refreshCounts() {
 }
 
 async function chooseCategory(category) {
-  state.category = category;
-  state.trash = false;
-  state.query = "";
-  state.filter = "all";
-  $("#global-search").value = "";
+  navigateTo({ kind: "list", category });
+}
+
+function routeFromLocation() {
+  const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
+  const parts = path ? path.split("/").map((part) => decodeURIComponent(part)) : [];
+  if (parts[0] === "search") return { kind: "search", query: new URLSearchParams(window.location.search).get("q")?.trim() || "" };
+  if (parts[0] === "trash" || parts[0] === "recently-removed") return { kind: "trash", category: state.category || "person" };
+  if (parts[0] === "list" && parts[1]) {
+    const listedCategory = ROUTE_SINGULARS[parts[1]] || (CATEGORIES[parts[1]] ? parts[1] : null);
+    if (listedCategory) return parts[2] ? { kind: "detail", category: listedCategory, id: parts.slice(2).join("/") } : { kind: "list", category: listedCategory };
+  }
+  const category = ROUTE_SINGULARS[parts[0]] || (parts[0] && CATEGORIES[parts[0]] ? parts[0] : null);
+  if (category) {
+    if (parts[1]) return { kind: "detail", category, id: parts.slice(1).join("/") };
+    const params = new URLSearchParams(window.location.search);
+    return { kind: "list", category, filter: params.get("filter") || "all", view: params.get("view") || undefined };
+  }
+  return { kind: "list", category: "person" };
+}
+
+function routePath(route) {
+  if (route.kind === "search") return `/search${route.query ? `?q=${encodeURIComponent(route.query)}` : ""}`;
+  if (route.kind === "trash") return "/trash";
+  const base = `/${ROUTE_PLURALS[route.category] || route.category}`;
+  if (route.kind === "detail") return `${base}/${encodeURIComponent(route.id)}`;
+  const params = new URLSearchParams();
+  if (route.filter && route.filter !== "all") params.set("filter", route.filter);
+  if (route.view && route.view !== "cards") params.set("view", route.view);
+  return `${base}${params.size ? `?${params}` : ""}`;
+}
+
+async function navigateTo(route, { replace = false } = {}) {
+  const path = routePath(route);
+  if (window.location.pathname + window.location.search !== path) {
+    const historyState = { atlasRoute: route };
+    if (route.kind === "detail") historyState.from = window.location.pathname + window.location.search;
+    window.history[replace ? "replaceState" : "pushState"](historyState, "", path);
+  }
+  await applyRoute(route);
+}
+
+function navigateBackFromDetail(category) {
+  if (window.history.state?.from) window.history.back();
+  else navigateTo({ kind: "list", category }, { replace: true });
+}
+
+async function applyRoute(route) {
+  if (!route) route = routeFromLocation();
+  state.route = route;
+  state.filter = route.kind === "list" && FILTERS[route.category]?.includes(route.filter) ? route.filter : "all";
+  if (route.kind === "list" && ["cards", "list"].includes(route.view)) state.view = route.view;
+  state.category = route.category || state.category || "person";
+  state.trash = route.kind === "trash";
+  state.query = route.kind === "search" ? route.query : "";
+  $("#global-search").value = state.query;
   closeSidebar();
-  closeDetail();
+  if (route.kind === "detail" && FULL_PAGE_CATEGORIES.has(route.category)) {
+    state.detailMode = "page";
+    closeDetail({ navigate: false });
+    updateHeading();
+    $("#view-heading")?.classList?.add("route-hidden");
+    $("#filter-bar").replaceChildren();
+    $("#new-record").hidden = true;
+    $("#new-record-top").hidden = true;
+    await openFullPageDetail(route.id);
+    return;
+  }
+  state.detailMode = route.kind === "detail" ? "drawer" : null;
+  $("#view-heading")?.classList?.remove("route-hidden");
+  closeDetail({ navigate: false });
   await loadCategory();
+  if (route.kind === "detail" && route.id) await openDetail(route.id, { fromRoute: true });
 }
 
 function updateHeading() {
@@ -344,7 +475,7 @@ function renderFilters() {
   bar.replaceChildren();
   const choices = state.trash || state.query ? [] : FILTERS[state.category] || [];
   choices.forEach((value) => {
-    bar.append(element("button", { class: `filter-chip${state.filter === value ? " active" : ""}`, type: "button", text: friendly(value), onclick: () => { state.filter = value; renderRecords(); renderFilters(); } }));
+    bar.append(element("button", { class: `filter-chip${state.filter === value ? " active" : ""}`, type: "button", text: friendly(value), onclick: () => navigateTo({ kind: "list", category: state.category, filter: value, view: state.view }, { replace: true }) }));
   });
 }
 
@@ -368,7 +499,7 @@ async function loadCategory() {
       state.trash || state.query ? Promise.resolve([]) : api(`/custom-fields?category=${encodeURIComponent(state.category)}`)
     ]);
     if (token !== state.loadToken) return;
-    state.records = listPayload(recordsPayload, "records");
+    state.records = listPayload(recordsPayload, "records").map(normalizedRecord);
     state.customFields = listPayload(fieldsPayload, "customFields").filter((field) => field.category === state.category);
     state.customFieldsCategory = state.trash || state.query ? null : state.category;
     renderRecords();
@@ -497,26 +628,81 @@ function renderGoalDescendants(parentId, records) {
 
 function renderPeople(records) {
   if (records.length === 1) {
-    const record = records[0];
-    return element("div", { class: "profile-layout" }, [profileHero(record), element("div", { class: "profile-stack" }, [
-      element("article", { class: "mini-card" }, [element("h3", { text: "Current status" }), element("p", { text: record.data?.status || "Not added yet" }), openRecordButton(record)]),
-      element("article", { class: "mini-card" }, [element("h3", { text: "Contact" }), element("p", { text: record.data?.contact || "Not added yet" }), openRecordButton(record)])
-    ])]);
+    return renderPersonProfile(records[0]);
   }
   const [first, ...rest] = records;
   return element("div", { class: "profile-layout" }, [profileHero(first), element("div", { class: "profile-stack" }, rest.map((record) => element("article", { class: "mini-card" }, [element("h3", { text: recordTitle(record) }), element("p", { text: recordSummary(record) || record.data?.location || "No portrait yet." }), openRecordButton(record)]))) ]);
 }
 
+function renderPersonProfile(record) {
+  const data = record.data || {};
+  const displayName = data.preferredName || recordTitle(record);
+  const definitionByKey = new Map(FIELD_DEFS.person.map((definition) => [definition[0], definition]));
+  const profile = element("article", { class: "person-profile" });
+  profile.append(element("header", { class: "person-profile-header" }, [
+    element("div", { class: "profile-monogram", text: displayName.trim().charAt(0).toUpperCase() || "?" }),
+    element("div", { class: "person-profile-heading" }, [
+      element("p", { class: "eyebrow", text: "Personal profile" }),
+      element("h2", { text: displayName }),
+      displayName !== recordTitle(record) ? element("p", { class: "person-legal-name", text: `Legal name: ${recordTitle(record)}` }) : null
+    ]),
+    element("button", { class: "button button-secondary person-edit-button", type: "button", onclick: () => openRecordDialog(record) }, [icon("edit"), "Edit profile"])
+  ]));
+
+  const sections = element("div", { class: "person-profile-sections" });
+  PERSON_PROFILE_GROUPS.forEach(([title, keys]) => {
+    const fields = element("dl", { class: "person-field-grid" });
+    keys.forEach((key) => {
+      const definition = definitionByKey.get(key);
+      if (!definition) return;
+      const [, label, type] = definition;
+      const value = data[key];
+      const empty = value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length);
+      fields.append(element("div", { class: `person-field${empty ? " is-empty" : ""}` }, [
+        element("dt", { text: label }),
+        element("dd", { text: empty ? "Not added" : displayDetailValue(value, type) })
+      ]));
+    });
+    sections.append(element("section", { class: "person-profile-section" }, [element("h3", { text: title }), fields]));
+  });
+  profile.append(sections);
+
+  const sensitiveFields = element("dl", { class: "person-field-grid person-sensitive-grid" });
+  PERSON_SENSITIVE_DEFS.forEach(([key, label]) => {
+    const value = data[key];
+    sensitiveFields.append(element("div", { class: `person-field${value ? "" : " is-empty"}` }, [
+      element("dt", { text: label }),
+      element("dd", { text: value || "Not added" })
+    ]));
+  });
+  profile.append(element("details", { class: "person-sensitive" }, [
+    element("summary", {}, [element("span", { text: "Sensitive information" }), element("small", { text: "Government identifiers" })]),
+    sensitiveFields
+  ]));
+  return profile;
+}
+
 function profileHero(record) {
+  const displayName = record.data?.preferredName || recordTitle(record);
   return element("article", { class: "profile-card" }, [
-    element("div", { class: "profile-monogram", text: recordTitle(record).trim().charAt(0).toUpperCase() || "?" }),
-    element("h2", { text: recordTitle(record) }),
+    element("div", { class: "profile-monogram", text: displayName.trim().charAt(0).toUpperCase() || "?" }),
+    element("h2", { text: displayName }),
+    displayName !== recordTitle(record) ? element("p", { class: "profile-legal-name", text: `Legal name: ${recordTitle(record)}` }) : null,
     element("p", { text: recordSummary(record) || "A portrait can be as sparse or as detailed as you like." }),
     openRecordButton(record)
   ]);
 }
 
-async function openDetail(id) {
+async function openDetail(id, { fromRoute = false } = {}) {
+  const record = state.records.find((item) => item.id === id) || state.allRecords.find((item) => item.id === id) || (state.selected?.id === id ? state.selected : null);
+  if (!fromRoute && record && FULL_PAGE_CATEGORIES.has(record.category)) {
+    await navigateTo({ kind: "detail", category: record.category, id });
+    return;
+  }
+  if (!fromRoute && record && ["person", "preference"].includes(record.category)) {
+    await navigateTo({ kind: "detail", category: record.category, id });
+    return;
+  }
   try {
     const payload = await api(`/records/${encodeURIComponent(id)}`);
     state.selected = recordPayload(payload);
@@ -525,28 +711,154 @@ async function openDetail(id) {
       state.customFields = listPayload(fieldsPayload, "customFields").filter((field) => field.category === state.selected.category);
       state.customFieldsCategory = state.selected.category;
     }
-    renderDetail(state.selected);
+    renderDetail(state.selected, $("#detail-content"), false);
     $("#detail-pane").classList.add("open");
     $("#detail-pane").setAttribute("aria-hidden", "false");
     $(".workspace").classList.add("detail-open");
     window.setTimeout(() => $("#close-detail").focus(), 50);
-  } catch (error) { notify(error.message, "error"); }
+  } catch (error) {
+    notify(error.message, "error");
+    if (fromRoute) await navigateTo({ kind: "list", category: state.category }, { replace: true });
+  }
 }
 
-function closeDetail() {
+function closeDetail({ navigate = true } = {}) {
+  if (navigate && state.route?.kind === "detail") {
+    navigateBackFromDetail(state.route.category);
+    return;
+  }
   state.selected = null;
   $("#detail-pane").classList.remove("open");
   $("#detail-pane").setAttribute("aria-hidden", "true");
   $(".workspace").classList.remove("detail-open");
 }
 
-function renderDetail(record) {
-  const root = $("#detail-content");
-  root.replaceChildren();
+const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
+const IMAGE_MAX_COUNT = 50;
+const IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+
+function imageLabel(image) {
+  return image.filename || image.name || image.originalName || "Experience image";
+}
+
+function renderExperienceGallery(record) {
+  const upload = record.trashed ? null : element("label", { class: "text-button gallery-upload" }, ["Upload", element("input", { type: "file", accept: "image/jpeg,image/png,image/webp", multiple: true, hidden: true, onchange: (event) => uploadExperienceImages(record, event.target.files) })]);
+  const section = detailSection("Gallery", upload, element("div", { class: "gallery-grid", "data-gallery-record": record.id }, element("p", { class: "detail-empty", text: "Loading images…" })));
+  loadExperienceImages(record, section.querySelector("[data-gallery-record]"));
+  return section;
+}
+
+async function loadExperienceImages(record, galleryRoot) {
+  try {
+    const response = await rawApi(`/records/${encodeURIComponent(record.id)}/images`);
+    const payload = await response.json();
+    const images = listPayload(payload, "images");
+    state.gallery = { recordId: record.id, images, loading: false };
+    if (!galleryRoot?.isConnected) return;
+    galleryRoot.replaceChildren();
+    if (!images.length) return galleryRoot.append(element("p", { class: "detail-empty", text: "No images yet. Upload a memory from this experience." }));
+    images.forEach((image) => {
+      const card = element("figure", { class: "gallery-item" });
+      const img = element("img", { src: `/api/images/${encodeURIComponent(image.id)}/content`, alt: imageLabel(image), loading: "lazy" });
+      const preview = element("button", { class: "gallery-preview", type: "button", "aria-label": `Open ${imageLabel(image)}`, onclick: () => openImageLightbox(image) }, img);
+      const caption = element("figcaption", {}, [element("span", { text: imageLabel(image) }), record.trashed ? null : element("button", { class: "icon-button danger", type: "button", "aria-label": `Delete ${imageLabel(image)}`, onclick: () => deleteExperienceImage(record, image) }, icon("trash"))]);
+      card.append(preview, caption);
+      galleryRoot.append(card);
+    });
+  } catch (error) {
+    if (error.status === 401 || error.status === 423) return lockLocally();
+    if (galleryRoot?.isConnected) galleryRoot.replaceChildren(element("p", { class: "detail-empty", text: `Images unavailable: ${error.message}` }));
+  }
+}
+
+async function uploadExperienceImages(record, files) {
+  const selected = [...(files || [])];
+  if (!selected.length) return;
+  const currentCount = state.gallery.recordId === record.id ? state.gallery.images.length : 0;
+  if (currentCount + selected.length > IMAGE_MAX_COUNT) return notify(`An experience can have at most ${IMAGE_MAX_COUNT} images.`, "error");
+  for (const file of selected) {
+    if (!IMAGE_TYPES.has(file.type)) return notify(`${file.name} is not a supported image. Use JPEG, PNG, or WebP.`, "error");
+    if (file.size > IMAGE_MAX_BYTES) return notify(`${file.name} is larger than 20 MiB.`, "error");
+  }
+  try {
+    for (const file of selected) {
+      await rawApi(`/records/${encodeURIComponent(record.id)}/images`, {
+        method: "POST",
+        headers: { "Content-Type": file.type, "X-Atlas-Filename": encodeURIComponent(file.name) },
+        body: file
+      });
+    }
+    notify(`${selected.length} image${selected.length === 1 ? "" : "s"} uploaded.`, "success");
+    await refreshDetailAfterMutation(record.id);
+  } catch (error) {
+    if (error.status === 401 || error.status === 423) return lockLocally();
+    notify(error.message, "error");
+  }
+}
+
+async function deleteExperienceImage(record, image) {
+  if (!window.confirm(`Delete “${imageLabel(image)}”?`)) return;
+  try {
+    await rawApi(`/images/${encodeURIComponent(image.id)}`, { method: "DELETE" });
+    notify("Image deleted.", "success");
+    await refreshDetailAfterMutation(record.id);
+  } catch (error) {
+    if (error.status === 401 || error.status === 423) return lockLocally();
+    notify(error.message, "error");
+  }
+}
+
+async function refreshDetailAfterMutation(id) {
+  if (state.route?.kind === "detail" && state.route.category === "experience") return openFullPageDetail(id);
+  if (state.selected?.id === id) return openDetail(id, { fromRoute: true });
+}
+
+function openImageLightbox(image) {
+  const dialog = $("#image-lightbox");
+  state.lightboxIndex = Math.max(0, state.gallery.images.findIndex((item) => item.id === image.id));
+  showLightboxImage();
+  dialog.showModal();
+}
+
+function showLightboxImage(offset = 0) {
+  const images = state.gallery.images;
+  if (!images.length) return;
+  state.lightboxIndex = (state.lightboxIndex + offset + images.length) % images.length;
+  const image = images[state.lightboxIndex];
+  $("#lightbox-image").src = `/api/images/${encodeURIComponent(image.id)}/content`;
+  $("#lightbox-image").alt = imageLabel(image);
+  $("#lightbox-caption").textContent = `${imageLabel(image)} · ${state.lightboxIndex + 1} of ${images.length}`;
+  $("#previous-lightbox").hidden = images.length < 2;
+  $("#next-lightbox").hidden = images.length < 2;
+}
+
+function displayDetailValue(value, type) {
+  if (Array.isArray(value)) return value.join(", ");
+  return type === "partial" ? formatDate(value) : friendly(value);
+}
+
+function renderDetail(record, target = $("#detail-content"), fullPage = false) {
+  let root = target;
+  if (fullPage) {
+    const page = element("div", { class: "detail-page" });
+    const editButton = element("button", { class: "button button-secondary", type: "button", text: "Edit", onclick: () => openRecordDialog(state.selected) });
+    editButton.hidden = Boolean(record.trashed || record.deletedAt);
+    const actions = element("header", { class: "detail-page-actions" }, [
+      element("button", { class: "detail-back", type: "button", onclick: () => navigateBackFromDetail(record.category) }, [element("span", { class: "detail-back-icon" }, icon("chevron")), element("span", { text: `Back to ${CATEGORIES[record.category]?.plural || "list"}` })]),
+      element("div", { class: "detail-header-actions" }, [
+        editButton,
+        element("button", { class: "button button-secondary danger-button", type: "button", text: record.trashed || record.deletedAt ? "Restore" : "Remove", onclick: removeOrRestore })
+      ])
+    ]);
+    root.replaceChildren(page);
+    page.append(actions);
+    root = element("div", { class: "detail-page-scroll" });
+    page.append(root);
+  } else root.replaceChildren();
   const meta = CATEGORIES[record.category] || CATEGORIES.resource;
   if (record.trashed || record.deletedAt) root.append(element("div", { class: "removed-banner" }, [icon("trash"), element("span", { text: "This entry is in recently removed." })]));
   root.append(element("div", { class: "detail-category" }, [icon(meta.icon), meta.label]));
-  const title = element("h2", { id: "detail-title", text: recordTitle(record) });
+  const title = element("h2", { id: fullPage ? "detail-page-title" : "detail-title", text: recordTitle(record) });
   root.append(title, element("p", { class: "detail-lede", text: recordSummary(record) || "No description yet." }));
   const properties = element("dl", { class: "property-list" });
   const summaryKey = {
@@ -554,14 +866,26 @@ function renderDetail(record) {
     project: record.data?.currentState ? "currentState" : "context", resource: "notes",
     relationship: record.data?.notes ? "notes" : "relationshipType", preference: "value"
   }[record.category];
-  const skipped = new Set([summaryKey]);
+  const skipped = new Set([summaryKey, ...PERSON_SENSITIVE_KEYS]);
   (FIELD_DEFS[record.category] || []).forEach(([key, label, type]) => {
     const value = record.data?.[key];
-    if (!value || skipped.has(key)) return;
-    properties.append(element("dt", { text: label }), element("dd", { text: type === "partial" ? formatDate(value) : friendly(value) }));
+    if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length) || skipped.has(key)) return;
+    properties.append(element("dt", { text: label }), element("dd", { text: displayDetailValue(value, type) }));
   });
   properties.append(element("dt", { text: "Updated" }), element("dd", { text: formatTimestamp(record.updatedAt) }), element("dt", { text: "Revision" }), element("dd", { text: String(record.revision || 1) }));
   root.append(detailSection("Details", null, properties));
+
+  if (record.category === "person") {
+    const sensitive = element("dl", { class: "property-list" });
+    PERSON_SENSITIVE_DEFS.forEach(([key, label]) => {
+      const value = record.data?.[key];
+      if (value) sensitive.append(element("dt", { text: label }), element("dd", { text: value }));
+    });
+    if (!sensitive.childNodes.length) sensitive.append(element("p", { class: "detail-empty", text: "No sensitive information has been added." }));
+    root.append(element("details", { class: "detail-section sensitive-section" }, [element("summary", { text: "Sensitive information" }), sensitive]));
+  }
+
+  if (record.category === "experience") root.append(renderExperienceGallery(record));
 
   const customList = element("dl", { class: "property-list" });
   const customValues = record.customFieldValues || {};
@@ -590,10 +914,29 @@ function renderDetail(record) {
   root.append(detailSection("Revision history", null, revisions));
   loadRevisions(record.id, revisions);
 
-  const removed = Boolean(record.trashed || record.deletedAt);
-  $("#detail-edit").hidden = removed;
-  $("#detail-remove").replaceChildren(icon(removed ? "restore" : "trash"));
-  $("#detail-remove").setAttribute("aria-label", removed ? "Restore entry" : "Move to recently removed");
+  if (!fullPage) {
+    const removed = Boolean(record.trashed || record.deletedAt);
+    $("#detail-edit").hidden = removed;
+    $("#detail-remove").replaceChildren(icon(removed ? "restore" : "trash"));
+    $("#detail-remove").setAttribute("aria-label", removed ? "Restore entry" : "Move to recently removed");
+  }
+}
+
+async function openFullPageDetail(id) {
+  try {
+    const payload = await api(`/records/${encodeURIComponent(id)}`);
+    state.selected = recordPayload(payload);
+    if (state.customFieldsCategory !== state.selected.category) {
+      const fieldsPayload = await api(`/custom-fields?category=${encodeURIComponent(state.selected.category)}`);
+      state.customFields = listPayload(fieldsPayload, "customFields").filter((field) => field.category === state.selected.category);
+      state.customFieldsCategory = state.selected.category;
+    }
+    renderDetail(state.selected, $("#content-stage"), true);
+    $("#main-content").focus({ preventScroll: true });
+  } catch (error) {
+    notify(error.message, "error");
+    await navigateTo({ kind: "list", category: state.category }, { replace: true });
+  }
 }
 
 function detailSection(title, action, content) {
@@ -607,7 +950,7 @@ async function loadRevisions(id, root) {
     root.replaceChildren();
     if (!revisions.length) return root.append(element("p", { class: "detail-empty", text: "No earlier revisions." }));
     revisions.forEach((revision) => root.append(element("div", { class: "revision-item" }, [
-      icon("history"), element("div", {}, [element("strong", { text: `Revision ${revision.revision}` }), element("small", { text: formatTimestamp(revision.createdAt || revision.updatedAt) })]),
+      element("div", {}, [element("strong", { text: `Revision ${revision.revision}` }), element("small", { text: formatTimestamp(revision.createdAt || revision.updatedAt) })]),
       revision.revision !== state.selected?.revision ? element("button", { class: "text-button", type: "button", text: "Restore", onclick: () => restoreRevision(revision.revision) }) : element("small", { text: "Current" })
     ])));
   } catch (error) { root.replaceChildren(element("p", { class: "detail-empty", text: `History unavailable: ${error.message}` })); }
@@ -618,8 +961,10 @@ async function restoreRevision(revision) {
   try {
     const payload = await api(`/records/${encodeURIComponent(state.selected.id)}/revisions/${revision}/restore`, { method: "POST", body: { revision: state.selected.revision } });
     state.selected = recordPayload(payload);
-    renderDetail(state.selected);
-    await Promise.all([loadCategory(), refreshCounts()]);
+    if (state.route?.kind === "detail" && FULL_PAGE_CATEGORIES.has(state.route.category)) renderDetail(state.selected, $("#content-stage"), true);
+    else renderDetail(state.selected, $("#detail-content"), false);
+    if (state.route?.kind === "detail" && FULL_PAGE_CATEGORIES.has(state.route.category)) await refreshCounts();
+    else await Promise.all([loadCategory(), refreshCounts()]);
     notify(`Revision ${revision} restored.`, "success");
   } catch (error) { notify(error.message, "error"); }
 }
@@ -627,6 +972,21 @@ async function restoreRevision(revision) {
 function inputForDefinition(definition, value = "") {
   const [key, label, type, required, placeholder, options] = definition;
   let control;
+  if (type === "repeatable" || type === "repeatableEmail") {
+    const values = Array.isArray(value) ? value : value ? String(value).split(/\r?\n/) : [];
+    const list = element("div", { class: "repeatable-list", dataset: { repeatable: key } });
+    const add = (itemValue = "") => {
+      const row = element("div", { class: "repeatable-row" });
+      const input = element("input", { type: type === "repeatableEmail" ? "email" : "text", value: itemValue, placeholder, required: required && !list.children.length });
+      const remove = element("button", { class: "icon-button", type: "button", "aria-label": `Remove ${label.toLowerCase()}`, onclick: () => { row.remove(); if (required && !list.querySelector("input")) add(); } }, icon("close"));
+      row.append(input, remove);
+      list.append(row);
+    };
+    values.forEach((item) => add(item));
+    const addButton = element("button", { class: "text-button repeatable-add", type: "button", text: "Add another", onclick: () => { add(); list.lastElementChild?.querySelector("input")?.focus(); } });
+    if (!values.length && required) add();
+    return element("div", { class: "field full repeatable-field" }, [element("span", { text: label }), list, addButton]);
+  }
   if (type === "checkbox") {
     control = element("input", { name: key, type: "checkbox", checked: Boolean(value) });
     return element("label", { class: "check-row full" }, [control, element("span", { text: placeholder || label })]);
@@ -670,9 +1030,14 @@ async function openRecordDialog(record = null) {
   const fields = $("#record-fields");
   fields.replaceChildren();
   (FIELD_DEFS[category] || []).forEach((definition) => {
-    const value = definition[0] === "title" ? record?.title : record?.data?.[definition[0]];
+    const value = definition[0] === "title" ? record?.title : category === "person" ? personData(record)[definition[0]] : record?.data?.[definition[0]];
     fields.append(inputForDefinition(definition, value ?? ""));
   });
+  if (category === "person") {
+    const sensitiveBody = element("div", { class: "form-grid sensitive-fields" });
+    PERSON_SENSITIVE_DEFS.forEach((definition) => sensitiveBody.append(inputForDefinition(definition, record?.data?.[definition[0]] ?? "")));
+    fields.append(element("details", { class: "sensitive-editor" }, [element("summary", { text: "Sensitive information" }), sensitiveBody]));
+  }
   if (category === "goal") {
     const parent = element("select", { name: "parentId" }, element("option", { value: "", text: "No parent goal" }));
     state.records.filter((item) => item.category === "goal" && item.id !== record?.id).forEach((item) => parent.append(element("option", { value: item.id, text: recordTitle(item), selected: item.id === record?.parentId })));
@@ -708,10 +1073,21 @@ async function saveRecord(event) {
   const customFieldValues = { ...(state.editing?.customFieldValues || {}) };
   (FIELD_DEFS[category] || []).forEach(([key, , type]) => {
     if (key === "title") return;
+    if (type === "repeatable" || type === "repeatableEmail") {
+      const values = $$(`[data-repeatable="${key}"] input`, form).map((input) => input.value.trim()).filter(Boolean);
+      if (values.length) data[key] = values;
+      return;
+    }
     const control = form.elements.namedItem(key);
     if (!control) return;
     data[key] = type === "checkbox" ? control.checked : type === "number" && control.value !== "" ? Number(control.value) : control.value.trim();
   });
+  if (category === "person") {
+    PERSON_SENSITIVE_DEFS.forEach(([key]) => {
+      const control = form.elements.namedItem(key);
+      if (control?.value.trim()) data[key] = control.value.trim();
+    });
+  }
   $$('[data-custom-field]', form).forEach((wrapper) => {
     const control = $("input,textarea,select", wrapper);
     const type = wrapper.dataset.customType;
@@ -728,7 +1104,8 @@ async function saveRecord(event) {
   try {
     if (state.editing) {
       body.revision = state.editing.revision;
-      await api(`/records/${encodeURIComponent(state.editing.id)}`, { method: "PATCH", body });
+      const updated = await api(`/records/${encodeURIComponent(state.editing.id)}`, { method: "PATCH", body });
+      state.selected = recordPayload(updated);
       notify("Entry updated.", "success");
     } else {
       body.category = category;
@@ -736,9 +1113,18 @@ async function saveRecord(event) {
       notify("Entry added to your atlas.", "success");
     }
     $("#record-dialog").close();
+    const editedId = state.editing?.id;
     state.editing = null;
-    closeDetail();
-    await Promise.all([loadCategory(), refreshCounts()]);
+    if (editedId && state.route?.kind === "detail" && FULL_PAGE_CATEGORIES.has(state.route.category)) {
+      await refreshCounts();
+      await openFullPageDetail(editedId);
+    } else if (editedId && state.route?.kind === "detail") {
+      await Promise.all([loadCategory(), refreshCounts()]);
+      await openDetail(editedId, { fromRoute: true });
+    } else {
+      closeDetail({ navigate: false });
+      await Promise.all([loadCategory(), refreshCounts()]);
+    }
   } catch (error) {
     if (error.status === 409) notify("This entry changed in another session. Reopen it and try again.", "error");
     else notify(error.message, "error");
@@ -755,8 +1141,13 @@ async function removeOrRestore() {
     const method = removed ? "POST" : "DELETE";
     await api(path, { method, body: { revision: record.revision } });
     notify(removed ? "Entry restored." : "Entry moved to recently removed.", "success");
-    closeDetail();
-    await Promise.all([loadCategory(), refreshCounts()]);
+    if (state.route?.kind === "detail") {
+      navigateBackFromDetail(state.route.category);
+      await refreshCounts();
+    } else {
+      closeDetail({ navigate: false });
+      await Promise.all([loadCategory(), refreshCounts()]);
+    }
   } catch (error) { notify(error.message, "error"); }
 }
 
@@ -842,11 +1233,16 @@ async function exportBackup() {
   const passphrase = await requestSecret();
   if (!passphrase) return;
   try {
-    const payload = await api("/export", { method: "POST", body: { passphrase } });
-    const envelope = payload?.envelope ?? payload;
-    const blob = new Blob([JSON.stringify(envelope, null, 2)], { type: "application/json" });
+    const response = await rawApi("/export", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/vnd.eidolon-atlas-backup, application/octet-stream, application/json" }, body: JSON.stringify({ passphrase }) });
+    const type = response.headers.get("content-type") || "application/octet-stream";
+    let blob;
+    if (type.includes("json")) {
+      const payload = await response.json();
+      const envelope = payload?.envelope ?? payload;
+      blob = new Blob([JSON.stringify(envelope, null, 2)], { type: "application/json" });
+    } else blob = await response.blob();
     const url = URL.createObjectURL(blob);
-    const link = element("a", { href: url, download: `eidolon-atlas-${new Date().toISOString().slice(0,10)}.atlas.json` });
+    const link = element("a", { href: url, download: `eidolon-atlas-${new Date().toISOString().slice(0,10)}.atlas` });
     document.body.append(link); link.click(); link.remove(); URL.revokeObjectURL(url);
     notify("Encrypted backup downloaded.", "success");
   } catch (error) { notify(error.message, "error"); }
@@ -858,21 +1254,34 @@ async function importBackup() {
   if (!file || !passphrase || !$("#import-confirm").checked) return;
   const button = $("#import-button");
   setButtonBusy(button, true, "Importing…");
+  let uploadId = null;
   try {
-    const envelope = JSON.parse(await file.text());
-    await api("/import", { method: "POST", body: { passphrase, envelope } });
+    const lowerName = file.name.toLowerCase();
+    const legacy = lowerName.endsWith(".json") || (!lowerName.endsWith(".atlas") && file.type.includes("json"));
+    if (legacy) {
+      const envelope = JSON.parse(await file.text());
+      await api("/import", { method: "POST", body: { passphrase, envelope } });
+    } else {
+      const uploaded = await rawApi("/import-uploads", { method: "POST", headers: { "Content-Type": "application/vnd.eidolon-atlas-backup", Accept: "application/json" }, body: file });
+      const payload = await uploaded.json();
+      uploadId = payload?.uploadId;
+      if (!uploadId) throw new Error("The backup upload did not return an upload id.");
+      await api(`/import-uploads/${encodeURIComponent(uploadId)}/commit`, { method: "POST", body: { passphrase } });
+    }
     $("#backup-dialog").close();
     notify("Backup imported successfully.", "success");
-    closeDetail();
+    if (state.route?.kind === "detail") await navigateTo({ kind: "list", category: state.route.category });
+    else closeDetail({ navigate: false });
     await Promise.all([loadCategory(), refreshCounts()]);
   } catch (error) {
+    if (uploadId) { try { await rawApi(`/import-uploads/${encodeURIComponent(uploadId)}`, { method: "DELETE" }); } catch { /* best effort cleanup */ } }
     notify(error instanceof SyntaxError ? "That file is not a valid atlas backup." : error.message, "error");
   } finally { setButtonBusy(button, false); }
 }
 
 function openPromptDialog() {
   const prompts = [
-    { category: "person", icon: "person", title: "A profile to complete", recordTitle: "My profile", description: "Create a blank personal portrait.", data: { summary: "", contact: "", address: "", status: "" } },
+    { category: "person", icon: "person", title: "A profile to complete", recordTitle: "My legal name", description: "Create a blank personal portrait.", data: { preferredName: "", gender: "", birthDate: "", birthPlace: "", nationalities: [], languages: [], maritalStatus: "", emails: [], phoneNumbers: [], address: "", summary: "", notes: "" } },
     { category: "goal", icon: "compass", title: "A direction to name", recordTitle: "An intention to define", description: "Hold a place for one active intention.", data: { horizon: "short", status: "active", targetDate: "", progressNote: "", motivation: "" } },
     { category: "resource", icon: "bookmark", title: "Something useful", recordTitle: "A useful resource", description: "Save a place for a resource you rely on.", data: { kind: "other", ownership: "", access: "", availability: "available", quantity: "", unit: "", notes: "" } }
   ];
@@ -911,7 +1320,7 @@ async function lockAtlas() {
 }
 
 function lockLocally() {
-  closeDetail();
+  closeDetail({ navigate: false });
   state.records = [];
   state.allRecords = [];
   state.customFields = [];
@@ -955,7 +1364,7 @@ function wireEvents() {
   $("#close-detail").addEventListener("click", closeDetail);
   $("#detail-edit").addEventListener("click", () => state.selected && openRecordDialog(state.selected));
   $("#detail-remove").addEventListener("click", removeOrRestore);
-  $("#trash-button").addEventListener("click", async () => { state.trash = true; state.query = ""; state.filter = "all"; $("#global-search").value = ""; closeSidebar(); closeDetail(); await loadCategory(); });
+  $("#trash-button").addEventListener("click", async () => { await navigateTo({ kind: "trash", category: state.category }); });
   $("#backup-button").addEventListener("click", () => { closeSidebar(); openBackupDialog(); });
   $("#lock-button").addEventListener("click", lockAtlas);
   $("#open-sidebar").addEventListener("click", openSidebar);
@@ -970,6 +1379,9 @@ function wireEvents() {
   $("#export-button").addEventListener("click", exportBackup);
   $("#import-button").addEventListener("click", importBackup);
   $("#prompt-form").addEventListener("submit", savePrompts);
+  $("#close-lightbox").addEventListener("click", () => $("#image-lightbox").close());
+  $("#previous-lightbox").addEventListener("click", () => showLightboxImage(-1));
+  $("#next-lightbox").addEventListener("click", () => showLightboxImage(1));
   $$('[data-close-dialog]').forEach((button) => button.addEventListener("click", () => button.closest("dialog")?.close("cancel")));
   [$("#import-file"), $("#backup-passphrase"), $("#import-confirm")].forEach((control) => control.addEventListener("input", () => {
     $("#import-button").disabled = !$("#import-file").files.length || !$("#backup-passphrase").value || !$("#import-confirm").checked;
@@ -977,15 +1389,18 @@ function wireEvents() {
   let searchTimer;
   $("#global-search").addEventListener("input", (event) => {
     window.clearTimeout(searchTimer);
-    searchTimer = window.setTimeout(() => { state.query = event.target.value.trim(); state.trash = false; state.filter = "all"; closeDetail(); loadCategory(); }, 240);
+    searchTimer = window.setTimeout(() => navigateTo({ kind: "search", query: event.target.value.trim() }), 240);
   });
-  $$("#view-toggle button").forEach((button) => button.addEventListener("click", () => { state.view = button.dataset.view; updateHeading(); renderRecords(); }));
+  $$("#view-toggle button").forEach((button) => button.addEventListener("click", () => navigateTo({ kind: "list", category: state.category, filter: state.filter, view: button.dataset.view }, { replace: true })));
   document.addEventListener("keydown", (event) => {
     const activeTag = document.activeElement?.tagName;
     if (event.key === "/" && !["INPUT", "TEXTAREA", "SELECT"].includes(activeTag) && !$("#app").hidden) { event.preventDefault(); $("#global-search").focus(); }
     if (event.key === "Escape" && $("#detail-pane").classList.contains("open") && !$(`dialog[open]`)) closeDetail();
+    if ($("#image-lightbox").open && event.key === "ArrowLeft") { event.preventDefault(); showLightboxImage(-1); }
+    if ($("#image-lightbox").open && event.key === "ArrowRight") { event.preventDefault(); showLightboxImage(1); }
   });
   window.addEventListener("scroll", () => $(".topbar")?.classList.toggle("scrolled", window.scrollY > 8), { passive: true });
+  window.addEventListener("popstate", () => { if (!$("#app").hidden) applyRoute(routeFromLocation()); });
 }
 
 initialize();

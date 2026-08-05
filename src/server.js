@@ -1,8 +1,10 @@
 import { createServer as createNodeServer } from 'node:http';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, resolve, sep } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
-import { Atlas } from './atlas.js';
+import { Atlas, BACKUP_UPLOAD_MAX_BYTES, IMAGE_MAX_BYTES } from './atlas.js';
 import { AtlasError, errorBody, fail } from './errors.js';
 import { requireObject } from './domain.js';
 
@@ -55,6 +57,23 @@ async function readJson(request, limit) {
   }
 }
 
+async function readBytes(request, limit) {
+  const declared = request.headers['content-length'];
+  if (declared !== undefined) {
+    const length = Number(declared);
+    if (!Number.isSafeInteger(length) || length < 0) fail(400, 'INVALID_CONTENT_LENGTH', 'Content-Length is invalid.');
+    if (length > limit) fail(413, 'REQUEST_TOO_LARGE', `Request body exceeds the ${limit}-byte limit.`);
+  }
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of request) {
+    size += chunk.length;
+    if (size > limit) fail(413, 'REQUEST_TOO_LARGE', `Request body exceeds the ${limit}-byte limit.`);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, size);
+}
+
 function decodeSegment(value) {
   try { return decodeURIComponent(value); } catch { fail(400, 'INVALID_PATH', 'Request path contains invalid encoding.'); }
 }
@@ -92,10 +111,45 @@ function validateApiRequest(request) {
     (request.headers['content-length'] !== undefined && request.headers['content-length'] !== '0');
   if (hasBody) {
     const contentType = (request.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase();
-    if (contentType !== 'application/json') {
+    const path = (() => { try { return new URL(request.url ?? '/', 'http://localhost').pathname; } catch { return ''; } })();
+    const imageUpload = method === 'POST' && /^\/api\/records\/[^/]+\/images$/.test(path);
+    const backupUpload = method === 'POST' && path === '/api/import-uploads';
+    if (imageUpload && !['image/jpeg', 'image/png', 'image/webp'].includes(contentType)) {
+      fail(415, 'UNSUPPORTED_MEDIA_TYPE', 'Image uploads must use image/jpeg, image/png, or image/webp.');
+    }
+    if (backupUpload && !['application/vnd.eidolon-atlas-backup', 'application/octet-stream'].includes(contentType)) {
+      fail(415, 'UNSUPPORTED_MEDIA_TYPE', 'Backup uploads must use application/vnd.eidolon-atlas-backup.');
+    }
+    if (!imageUpload && !backupUpload && contentType !== 'application/json') {
       fail(415, 'UNSUPPORTED_MEDIA_TYPE', 'Request body must use application/json.');
     }
   }
+}
+
+function uploadFilename(request) {
+  const encoded = request.headers['x-atlas-filename'];
+  if (typeof encoded !== 'string' || encoded === '') fail(400, 'VALIDATION_ERROR', 'X-Atlas-Filename is required.');
+  try { return decodeURIComponent(encoded); } catch { fail(400, 'VALIDATION_ERROR', 'X-Atlas-Filename must be URI encoded.'); }
+}
+
+async function sendImage(response, image) {
+  response.writeHead(200, {
+    'Content-Type': image.metadata.mimeType,
+    'Content-Length': image.bytes.length,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(image.metadata.filename)}`,
+  });
+  async function* content() {
+    try {
+      for (let offset = 0; offset < image.bytes.length; offset += 64 * 1024) {
+        yield Buffer.from(image.bytes.subarray(offset, Math.min(offset + 64 * 1024, image.bytes.length)));
+      }
+    } finally {
+      image.bytes.fill(0);
+    }
+  }
+  await pipeline(Readable.from(content()), response);
 }
 
 async function routeApi(atlas, request, response, url, limits) {
@@ -125,7 +179,28 @@ async function routeApi(atlas, request, response, url, limits) {
   if (method === 'POST' && path === '/api/records') {
     return sendJson(response, 201, atlas.createRecord(await readJson(request, limits.body)));
   }
-  let match = /^\/api\/records\/([^/]+)$/.exec(path);
+  let match = /^\/api\/records\/([^/]+)\/images$/.exec(path);
+  if (match) {
+    const recordId = decodeSegment(match[1]);
+    if (method === 'GET') return sendJson(response, 200, atlas.listImages(recordId));
+    if (method === 'POST') {
+      const mimeType = (request.headers['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase();
+      const filename = uploadFilename(request);
+      const bytes = await readBytes(request, IMAGE_MAX_BYTES);
+      try {
+        return sendJson(response, 201, atlas.createImage(recordId, {
+          filename, mimeType, bytes,
+        }));
+      } finally {
+        bytes.fill(0);
+      }
+    }
+  }
+  match = /^\/api\/images\/([^/]+)\/content$/.exec(path);
+  if (match && method === 'GET') return sendImage(response, atlas.getImageContent(decodeSegment(match[1])));
+  match = /^\/api\/images\/([^/]+)$/.exec(path);
+  if (match && method === 'DELETE') return sendJson(response, 200, atlas.deleteImage(decodeSegment(match[1])));
+  match = /^\/api\/records\/([^/]+)$/.exec(path);
   if (match) {
     const id = decodeSegment(match[1]);
     if (method === 'GET') return sendJson(response, 200, atlas.getRecord(id));
@@ -170,12 +245,31 @@ async function routeApi(atlas, request, response, url, limits) {
   }
   if (method === 'POST' && path === '/api/export') {
     const body = requirePassphraseBody(await readJson(request, limits.body));
-    return sendJson(response, 200, await atlas.export(body.passphrase));
+    const exported = await atlas.exportV2(body.passphrase);
+    response.writeHead(200, {
+      'Content-Type': exported.contentType,
+      'Content-Length': exported.byteLength,
+      'Content-Disposition': `attachment; filename="${exported.filename}"`,
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+    });
+    await pipeline(Readable.from(exported.stream), response);
+    return;
   }
   if (method === 'POST' && path === '/api/import') {
     const body = requirePassphraseBody(await readJson(request, limits.import), true);
     return sendJson(response, 200, await atlas.import(body.passphrase, body.envelope));
   }
+  if (method === 'POST' && path === '/api/import-uploads') {
+    return sendJson(response, 201, await atlas.stageImportUpload(request, { maxBytes: limits.upload }));
+  }
+  match = /^\/api\/import-uploads\/([^/]+)\/commit$/.exec(path);
+  if (match && method === 'POST') {
+    const body = requirePassphraseBody(await readJson(request, limits.body));
+    return sendJson(response, 200, await atlas.commitImportUpload(decodeSegment(match[1]), body.passphrase));
+  }
+  match = /^\/api\/import-uploads\/([^/]+)$/.exec(path);
+  if (match && method === 'DELETE') return sendJson(response, 200, await atlas.cancelImportUpload(decodeSegment(match[1])));
   fail(404, 'NOT_FOUND', 'API endpoint not found.');
 }
 
@@ -215,6 +309,7 @@ export function createServer({
   publicDir = fileURLToPath(new URL('../public', import.meta.url)),
   bodyLimit = DEFAULT_BODY_LIMIT,
   importLimit = DEFAULT_IMPORT_LIMIT,
+  uploadLimit = BACKUP_UPLOAD_MAX_BYTES,
 } = {}) {
   const publicRoot = resolve(publicDir);
   const server = createNodeServer(async (request, response) => {
@@ -225,7 +320,7 @@ export function createServer({
       }
       const url = new URL(request.url ?? '/', `http://${host}`);
       if (url.pathname.startsWith('/api/')) {
-        await routeApi(atlas, request, response, url, { body: bodyLimit, import: importLimit });
+        await routeApi(atlas, request, response, url, { body: bodyLimit, import: importLimit, upload: uploadLimit });
       } else if (request.method === 'GET' || request.method === 'HEAD') {
         await serveStatic(response, url.pathname, publicRoot);
       } else {

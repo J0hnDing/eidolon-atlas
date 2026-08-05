@@ -10,6 +10,11 @@ export const CUSTOM_FIELD_TYPES = Object.freeze([
 const CATEGORY_SET = new Set(CATEGORIES);
 const FIELD_TYPE_SET = new Set(CUSTOM_FIELD_TYPES);
 const PARTIAL_DATE = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/;
+const PERSON_STRING_FIELDS = Object.freeze([
+  'preferredName', 'gender', 'birthPlace', 'maritalStatus', 'address', 'summary', 'notes',
+  'passportNumber', 'nationalIdNumber', 'driversLicenseNumber', 'taxIdNumber',
+]);
+const PERSON_STRING_ARRAY_FIELDS = Object.freeze(['nationalities', 'languages', 'emails', 'phoneNumbers']);
 
 export function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -70,6 +75,22 @@ function requireString(value, label, { allowEmpty = false } = {}) {
 
 function validateCategoryData(category, data) {
   requireObject(data, 'data');
+  if (category === 'person') {
+    for (const field of PERSON_STRING_FIELDS) {
+      if (data[field] !== undefined && typeof data[field] !== 'string') {
+        fail(400, 'VALIDATION_ERROR', `Person ${field} must be a string.`);
+      }
+    }
+    if (data.birthDate !== undefined && data.birthDate !== '') {
+      validatePartialDate(data.birthDate, 'Person birthDate');
+    }
+    for (const field of PERSON_STRING_ARRAY_FIELDS) {
+      if (data[field] !== undefined && (!Array.isArray(data[field]) ||
+          data[field].some((value) => typeof value !== 'string' || value.trim() === ''))) {
+        fail(400, 'VALIDATION_ERROR', `Person ${field} must be an ordered array of non-empty strings.`);
+      }
+    }
+  }
   if (category === 'experience') {
     if (!['event', 'period'].includes(data.kind)) {
       fail(400, 'VALIDATION_ERROR', 'Experience data.kind must be event or period.');

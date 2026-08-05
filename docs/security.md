@@ -27,7 +27,11 @@ Restart or manual lock discards the in-memory key.
 Application-layer encryption leaves SQLite structure visible: an observer may
 learn record counts, categories, timestamps, hierarchy, and link topology.
 Whole-file encryption would require a native SQLCipher dependency and is not a
-v1 goal.
+v1 goal. Experience image bytes are encrypted as attachments; their
+association, count, timestamps, and approximate size remain visible. Images
+are limited to JPEG, PNG, and WebP, 20 MiB per image, and 50 images per
+Experience. Attachment ciphertext is independent of record revision history
+and retained through trash.
 
 There is no passphrase recovery. If the passphrase and usable backups are lost,
 the data is unrecoverable. If the application is unlocked, another process
@@ -37,5 +41,8 @@ application memory.
 ## Backups
 
 Exports use their own salt, key derivation parameters, nonce, and authentication
-tag. A backup passphrase is requested for every export or import and is never
-stored. Keep at least one tested backup away from the live database.
+tag. Backup v2 is a streamed binary encrypted `.atlas` format; imports stage
+encrypted content and atomically replace the database without decrypted
+temporary image files. v1 JSON envelopes remain import-compatible. A backup
+passphrase is requested for every export or import and is never stored. Keep at
+least one tested backup away from the live database.

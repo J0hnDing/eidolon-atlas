@@ -11,6 +11,9 @@ flowchart LR
     Crypto --> SQLite[("SQLite")]
 ```
 
+The browser routes Experience, Goal, Project, Resource, and Relationship
+details to full-page views; Person and Preference details remain drawer views.
+
 ## Boundaries
 
 - `public/` owns rendering, interaction, accessible dialogs, and client-side
@@ -23,6 +26,10 @@ flowchart LR
   envelopes. Decrypted content never enters SQL queries or logs.
 - The database layer owns numbered migrations, constraints, transactions, WAL,
   and test database injection.
+- Experience images are stored as encrypted binary attachments. The database
+  keeps only attachment association, count, timestamps, and approximate size in
+  clear structural columns; attachment changes do not participate in record
+  revisions, and attachments survive trash.
 
 The browser's JSON API is an application interface, not an agent contract.
 There are no agent discovery, tool catalog, OpenAPI, MCP, or autonomous write
@@ -37,7 +44,13 @@ and a small implementation over a plaintext full-text index.
 
 ## Transfer
 
-Export serializes the complete logical state—including history and trash—then
-encrypts it with a separately derived backup key. Import decrypts and validates
-the complete snapshot before beginning one replacement transaction. A failed
-decrypt, validation, or write leaves the existing atlas unchanged.
+Export serializes the complete logical state—including history and trash—and
+streams attachment bytes through a separately derived backup key. Import
+decrypts and validates the complete snapshot before beginning one replacement
+transaction. A failed decrypt, validation, or write leaves the existing atlas
+unchanged.
+
+Backup v2 is a streamed binary encrypted `.atlas` format containing
+attachments. Import uses encrypted staging, never decrypted temporary image
+files, and atomically replaces the atlas after validation. Legacy v1 JSON
+backup envelopes remain import-compatible.

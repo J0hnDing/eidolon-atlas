@@ -69,7 +69,7 @@
       </header>
 
       <main id="main-content" class="main-content" tabindex="-1">
-        <header class="view-heading">
+        <header id="view-heading" class="view-heading">
           <div>
             <p id="view-eyebrow" class="eyebrow"></p>
             <h1 id="view-title"></h1>
@@ -116,9 +116,9 @@
       <header class="modal-header"><div><p class="eyebrow">Encrypted portability</p><h2>Backup &amp; restore</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body stack">
         <div class="callout"><span data-icon="shield"></span><p>Backups are encrypted envelopes. Keep the file and its passphrase safe.</p></div>
-        <div class="backup-choice"><div><strong>Export atlas</strong><p>Download an encrypted <code>.atlas.json</code> backup.</p></div><button id="export-button" class="button button-secondary" type="button">Export</button></div>
+        <div class="backup-choice"><div><strong>Export atlas</strong><p>Download an encrypted binary <code>.atlas</code> backup.</p></div><button id="export-button" class="button button-secondary" type="button">Export</button></div>
         <div class="divider"><span>or restore</span></div>
-        <label class="field"><span>Encrypted backup file</span><input id="import-file" type="file" accept=".json,.atlas.json,application/json"></label>
+        <label class="field"><span>Encrypted backup file</span><input id="import-file" type="file" accept=".atlas,.json,.atlas.json,application/vnd.eidolon-atlas-backup,application/octet-stream,application/json"></label>
         <label class="field"><span>Backup passphrase</span><input id="backup-passphrase" type="password" autocomplete="off"></label>
         <label class="check-row"><input id="import-confirm" type="checkbox"><span>I understand that importing may replace matching entries.</span></label>
       </div>
@@ -167,6 +167,14 @@
       </div>
       <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Skip for now</button><button class="button button-primary" type="submit">Add selected markers</button></footer>
     </form>
+  </dialog>
+
+  <dialog id="image-lightbox" class="modal image-lightbox" aria-label="Experience image preview">
+    <button id="close-lightbox" class="icon-button lightbox-close" type="button" data-icon="close" aria-label="Close image preview"></button>
+    <button id="previous-lightbox" class="icon-button lightbox-nav lightbox-previous" type="button" data-icon="chevron" aria-label="Previous image"></button>
+    <img id="lightbox-image" alt="">
+    <button id="next-lightbox" class="icon-button lightbox-nav lightbox-next" type="button" data-icon="chevron" aria-label="Next image"></button>
+    <p id="lightbox-caption" class="lightbox-caption"></p>
   </dialog>
 
   <script src="/app.js" defer></script>
