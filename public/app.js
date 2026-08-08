@@ -10,6 +10,17 @@ const CATEGORIES = {
   preference: { label: "Preference", plural: "Preferences", icon: "sliders", accent: "#5d7774", eyebrow: "Taste & defaults", description: "Choices, boundaries, and defaults you want to remember." }
 };
 
+const RELATIONSHIP_KINDS = [
+  { value: "family", label: "Family", icon: "person", accent: "#9b583b", description: "Parents, siblings, children, and other family connections." },
+  { value: "partner", label: "Partner / Spouse", icon: "spark", accent: "#a05d68", description: "Your spouse, partner, or significant romantic relationship." },
+  { value: "friend", label: "Friends", icon: "person", accent: "#6b7b69", description: "The friendships that are part of your life." },
+  { value: "acquaintance", label: "Acquaintances", icon: "link", accent: "#8c765d", description: "People you know and may want to remember in context." },
+  { value: "coworker", label: "Coworkers", icon: "layers", accent: "#6c6f85", description: "Colleagues and people from your working life." },
+  { value: "mentor", label: "Mentors", icon: "compass", accent: "#667763", description: "Teachers, advisors, coaches, and guiding figures." },
+  { value: "org", label: "Organizations", icon: "bookmark", accent: "#8b704c", description: "Companies, communities, institutions, and other organizations." }
+];
+const RELATIONSHIP_KIND_BY_VALUE = new Map(RELATIONSHIP_KINDS.map((kind) => [kind.value, kind]));
+
 const FIELD_DEFS = {
   person: [
     ["title", "Legal name", "text", true, "Your legal name"],
@@ -38,15 +49,15 @@ const FIELD_DEFS = {
   goal: [
     ["title", "Goal", "text", true, "A clear desired outcome"],
     ["horizon", "Horizon", "select", true, "", [["short", "Short term"], ["middle", "Middle term"], ["long", "Long term"]]],
-    ["status", "Status", "select", true, "", [["planned", "Planned"], ["active", "Active"], ["paused", "Paused"], ["completed", "Completed"], ["abandoned", "Abandoned"]]],
     ["targetDate", "Target date", "partial", false, "YYYY, YYYY-MM, or YYYY-MM-DD"],
     ["progressNote", "Progress note", "textarea", false, "A concise, current progress marker"],
     ["motivation", "Motivation", "textarea", false, "Why this outcome matters"]
   ],
   project: [
     ["title", "Project", "text", true, "What are you making?"],
+    ["status", "Status", "select", true, "", [["planned", "Planned"], ["active", "Active"], ["paused", "Paused"], ["completed", "Completed"], ["abandoned", "Abandoned"]]],
+    ["githubLink", "GitHub Link", "url", false, "https://github.com/owner/repository"],
     ["context", "Context", "textarea", false, "Purpose, desired outcome, and the context worth preserving"],
-    ["currentState", "Current state", "textarea", false, "A brief, current snapshot—not a task list"],
   ],
   resource: [
     ["title", "Resource", "text", true, "Name or title"],
@@ -60,7 +71,7 @@ const FIELD_DEFS = {
   ],
   relationship: [
     ["title", "Name", "text", true, "Person or organization"],
-    ["kind", "Kind", "select", true, "", [["person", "Person"], ["org", "Organization"]]],
+    ["kind", "Category", "select", true, "", RELATIONSHIP_KINDS.map(({ value, label }) => [value, label])],
     ["relationshipType", "Relationship type", "text", false, "How you are connected"],
     ["status", "Status", "select", false, "", [["active", "Active"], ["dormant", "Dormant"], ["past", "Past"]]],
     ["importance", "Importance", "select", false, "", [["low", "Low"], ["medium", "Medium"], ["high", "High"]]],
@@ -82,9 +93,9 @@ const FIELD_DEFS = {
 };
 
 const FILTERS = {
-  goal: ["all", "planned", "active", "paused", "completed", "abandoned"],
+  project: ["all", "planned", "active", "paused", "completed", "abandoned"],
   resource: ["all", "available", "limited", "unavailable"],
-  relationship: ["all", "person", "org"],
+  relationship: RELATIONSHIP_KINDS.map(({ value }) => value),
   preference: ["all", "work", "communication", "environment", "food", "style", "other"]
 };
 
@@ -96,6 +107,7 @@ const ICONS = {
   close: ["M6 6l12 12M18 6 6 18"],
   compass: ["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z", "m15.5 8.5-2 5-5 2 2-5z"],
   edit: ["M12 20h9", "M16.5 3.5a2.12 2.12 0 0 1 3 3L8 18l-4 1 1-4z"],
+  external: ["M14 3h7v7", "M10 14 21 3", "M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"],
   grid: ["M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"],
   history: ["M3 12a9 9 0 1 0 3-6.7L3 8", "M3 3v5h5", "M12 7v5l3 2"],
   key: ["M21 2l-2 2m-7.6 7.6a5 5 0 1 1-7.1 7.1 5 5 0 0 1 7.1-7.1Zm0 0L15 8l3 3 3-3-3-3"],
@@ -252,7 +264,7 @@ function recordPayload(payload) { return normalizedRecord(payload?.record || pay
 function recordTitle(record) { return record?.title || "Untitled entry"; }
 function recordSummary(record) {
   const data = record?.data || {};
-  return data.summary || data.narrative || data.currentState || data.context || data.progressNote || data.motivation || data.notes || data.value || data.relationshipType || data.location || data.preferredName || "";
+  return data.summary || data.narrative || data.context || data.progressNote || data.motivation || data.notes || data.value || data.relationshipType || data.location || data.preferredName || "";
 }
 
 function personData(recordOrData) {
@@ -277,6 +289,10 @@ function normalizedRecord(record) {
 
 function friendly(value) {
   return String(value || "").replace(/_/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
+}
+
+function relationshipKind(value) {
+  return RELATIONSHIP_KIND_BY_VALUE.get(value);
 }
 
 function formatDate(value) {
@@ -315,6 +331,13 @@ function setButtonBusy(button, busy, label = "Working…") {
     button.textContent = button.dataset.original || button.textContent;
     button.disabled = false;
   }
+}
+
+function setIconButtonBusy(button, busy) {
+  if (!button) return;
+  button.disabled = busy;
+  if (busy) button.setAttribute("aria-busy", "true");
+  else button.removeAttribute("aria-busy");
 }
 
 function showAuth(mode) {
@@ -457,14 +480,17 @@ async function applyRoute(route) {
 
 function updateHeading() {
   const meta = CATEGORIES[state.category];
-  $("#view-eyebrow").textContent = state.trash ? "Recover or remove" : state.query ? "Across every workspace" : meta.eyebrow;
-  $("#view-title").textContent = state.trash ? "Recently removed" : state.query ? "Search results" : meta.plural;
-  $("#view-description").textContent = state.trash ? "Entries remain encrypted and can be restored here." : state.query ? `Matches for “${state.query}”` : meta.description;
+  const relationshipMeta = state.category === "relationship" ? relationshipKind(state.filter) : null;
+  $("#view-eyebrow").textContent = state.trash ? "Recover or remove" : state.query ? "Across every workspace" : relationshipMeta ? "Relationships" : meta.eyebrow;
+  $("#view-title").textContent = state.trash ? "Recently removed" : state.query ? "Search results" : relationshipMeta?.label || meta.plural;
+  $("#view-description").textContent = state.trash ? "Restore entries you still need, or clean them up permanently." : state.query ? `Matches for “${state.query}”` : relationshipMeta?.description || meta.description;
   $("#new-record").hidden = state.trash || Boolean(state.query);
   $("#new-record-top").hidden = state.trash;
+  $("#empty-trash").hidden = true;
   $$(".category-nav .nav-row").forEach((button) => button.classList.toggle("active", !state.trash && !state.query && button.dataset.category === state.category));
   $("#trash-button").classList.toggle("active", state.trash);
-  const canToggle = !state.trash && !state.query && !["experience", "goal", "person"].includes(state.category);
+  const canToggle = !state.trash && !state.query && !["experience", "goal", "person"].includes(state.category) &&
+    !(state.category === "relationship" && state.filter === "all");
   $("#view-toggle").hidden = !canToggle;
   $$("#view-toggle button").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
   renderFilters();
@@ -473,6 +499,15 @@ function updateHeading() {
 function renderFilters() {
   const bar = $("#filter-bar");
   bar.replaceChildren();
+  if (!state.trash && !state.query && state.category === "relationship") {
+    if (relationshipKind(state.filter)) {
+      bar.append(element("button", { class: "relationship-back", type: "button", onclick: () => navigateTo({ kind: "list", category: "relationship" }) }, [
+        element("span", { class: "relationship-back-icon" }, icon("chevron")),
+        element("span", { text: "All relationship categories" })
+      ]));
+    }
+    return;
+  }
   const choices = state.trash || state.query ? [] : FILTERS[state.category] || [];
   choices.forEach((value) => {
     bar.append(element("button", { class: `filter-chip${state.filter === value ? " active" : ""}`, type: "button", text: friendly(value), onclick: () => navigateTo({ kind: "list", category: state.category, filter: value, view: state.view }, { replace: true }) }));
@@ -522,6 +557,10 @@ function renderRecords() {
   const personExists = !state.trash && !state.query && state.category === "person" && records.length > 0;
   $("#new-record").hidden = state.trash || Boolean(state.query) || personExists;
   $("#new-record-top").hidden = state.trash || personExists;
+  $("#empty-trash").hidden = !state.trash || records.length === 0;
+  if (!state.trash && !state.query && state.category === "relationship" && state.filter === "all") {
+    return stage.append(renderRelationshipOverview(state.records));
+  }
   if (!records.length) return stage.append(renderEmpty());
   if (state.trash || state.query) return stage.append(renderStandard(records, "list"));
   if (state.category === "experience") stage.append(renderTimeline(records));
@@ -532,11 +571,33 @@ function renderRecords() {
 
 function renderEmpty() {
   const searched = Boolean(state.query);
-  const title = state.trash ? "Nothing waiting here" : searched ? "No matching markers" : `Begin your ${CATEGORIES[state.category].label.toLowerCase()} workspace`;
-  const copy = state.trash ? "Removed entries will appear here until you restore them." : searched ? "Try a shorter phrase or another word." : "Your atlas grows one thoughtful entry at a time.";
+  const relationshipMeta = state.category === "relationship" ? relationshipKind(state.filter) : null;
+  const title = state.trash ? "Nothing waiting here" : searched ? "No matching markers" : relationshipMeta ? `No ${relationshipMeta.label.toLowerCase()} yet` : `Begin your ${CATEGORIES[state.category].label.toLowerCase()} workspace`;
+  const copy = state.trash ? "Removed entries will appear here until you restore them." : searched ? "Try a shorter phrase or another word." : relationshipMeta?.description || "Your atlas grows one thoughtful entry at a time.";
   const contents = [element("div", { class: "empty-orbit" }, icon(searched ? "search" : state.trash ? "trash" : CATEGORIES[state.category].icon)), element("h2", { text: title }), element("p", { text: copy })];
   if (!state.trash && !searched) contents.push(element("button", { class: "button button-primary", type: "button", onclick: () => openRecordDialog() }, [icon("plus"), "Add the first entry"]));
   return element("section", { class: "empty-state" }, element("div", {}, contents));
+}
+
+function renderRelationshipOverview(records) {
+  const root = element("div", { class: "relationship-category-grid" });
+  RELATIONSHIP_KINDS.forEach((kind, index) => {
+    const count = records.filter((record) => record.data?.kind === kind.value).length;
+    root.append(element("article", {
+      class: "relationship-category-card",
+      style: { "--relationship-accent": kind.accent, "animation-delay": `${index * 35}ms` }
+    }, [
+      element("div", { class: "relationship-category-top" }, [
+        element("span", { class: "relationship-category-symbol" }, icon(kind.icon)),
+        element("span", { class: "relationship-category-count", text: String(count) })
+      ]),
+      element("h2", { text: kind.label }),
+      element("p", { text: kind.description }),
+      element("span", { class: "relationship-category-open" }, ["View relationships", icon("chevron")]),
+      element("button", { type: "button", "aria-label": `View ${kind.label}`, onclick: () => navigateTo({ kind: "list", category: "relationship", filter: kind.value }) })
+    ]));
+  });
+  return root;
 }
 
 function renderFailure(error) {
@@ -554,15 +615,19 @@ function renderStandard(records, mode) {
   const root = element("div", { class: mode === "list" ? "record-list" : "card-grid" });
   records.forEach((record, index) => {
     const meta = CATEGORIES[record.category] || CATEGORIES.resource;
+    const relationshipMeta = record.category === "relationship" ? relationshipKind(record.data?.kind) : null;
+    const itemLabel = relationshipMeta?.label || meta.label;
+    const itemIcon = relationshipMeta?.icon || meta.icon;
+    const itemAccent = relationshipMeta?.accent || meta.accent;
     if (mode === "list") {
       root.append(element("article", { class: "record-row", style: { "--animation-order": index } }, [
-        element("div", { class: "category-symbol", style: { "--record-accent": meta.accent } }, icon(meta.icon)),
-        element("div", {}, [element("h3", { text: recordTitle(record) }), element("div", { class: "row-meta", text: `${meta.label} · ${recordSummary(record) || formatTimestamp(record.updatedAt)}` })]),
+        element("div", { class: "category-symbol", style: { "--record-accent": itemAccent } }, icon(itemIcon)),
+        element("div", {}, [element("h3", { text: recordTitle(record) }), element("div", { class: "row-meta", text: `${itemLabel} · ${recordSummary(record) || formatTimestamp(record.updatedAt)}` })]),
         icon("chevron"), openRecordButton(record)
       ]));
     } else {
-      root.append(element("article", { class: "record-card", style: { "--record-accent": meta.accent, "animation-delay": `${Math.min(index, 12) * 24}ms` } }, [
-        element("div", { class: "card-top" }, [element("div", { class: "category-symbol" }, icon(meta.icon)), element("span", { class: "eyebrow", text: meta.label })]),
+      root.append(element("article", { class: "record-card", style: { "--record-accent": itemAccent, "animation-delay": `${Math.min(index, 12) * 24}ms` } }, [
+        element("div", { class: "card-top" }, [element("div", { class: "category-symbol" }, icon(itemIcon)), element("span", { class: "eyebrow", text: itemLabel })]),
         element("h3", { text: recordTitle(record) }), element("p", { class: "card-summary", text: recordSummary(record) || "No notes yet." }),
         element("div", { class: "card-meta" }, [element("span", { text: record.data?.status ? friendly(record.data.status) : `Revision ${record.revision || 1}` }), element("span", { class: "dot" }), element("span", { text: formatTimestamp(record.updatedAt) })]),
         openRecordButton(record)
@@ -601,7 +666,7 @@ function renderGoals(records) {
     const column = element("section", { class: "goal-column" }, element("header", { class: "goal-column-head" }, [element("h2", { text: label }), element("span", { text: `${inHorizon.length} ${inHorizon.length === 1 ? "goal" : "goals"}` })]));
     const stack = element("div", { class: "goal-stack" });
     roots.forEach((record, index) => {
-      const cardChildren = [element("h3", { text: recordTitle(record) }), element("p", { text: recordSummary(record) || friendly(record.data?.status || "active") })];
+      const cardChildren = [element("h3", { text: recordTitle(record) }), element("p", { text: recordSummary(record) || "No progress note yet." })];
       const descendants = renderGoalDescendants(record.id, records);
       if (descendants) cardChildren.push(descendants);
       cardChildren.push(openRecordButton(record));
@@ -856,23 +921,27 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
     page.append(root);
   } else root.replaceChildren();
   const meta = CATEGORIES[record.category] || CATEGORIES.resource;
+  const relationshipMeta = record.category === "relationship" ? relationshipKind(record.data?.kind) : null;
   if (record.trashed || record.deletedAt) root.append(element("div", { class: "removed-banner" }, [icon("trash"), element("span", { text: "This entry is in recently removed." })]));
-  root.append(element("div", { class: "detail-category" }, [icon(meta.icon), meta.label]));
+  root.append(element("div", { class: "detail-category" }, [icon(relationshipMeta?.icon || meta.icon), relationshipMeta ? `Relationship · ${relationshipMeta.label}` : meta.label]));
   const title = element("h2", { id: fullPage ? "detail-page-title" : "detail-title", text: recordTitle(record) });
   root.append(title, element("p", { class: "detail-lede", text: recordSummary(record) || "No description yet." }));
   const properties = element("dl", { class: "property-list" });
   const summaryKey = {
     person: "summary", experience: "narrative", goal: record.data?.progressNote ? "progressNote" : "motivation",
-    project: record.data?.currentState ? "currentState" : "context", resource: "notes",
+    project: "context", resource: "notes",
     relationship: record.data?.notes ? "notes" : "relationshipType", preference: "value"
   }[record.category];
   const skipped = new Set([summaryKey, ...PERSON_SENSITIVE_KEYS]);
   (FIELD_DEFS[record.category] || []).forEach(([key, label, type]) => {
     const value = record.data?.[key];
     if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length) || skipped.has(key)) return;
-    properties.append(element("dt", { text: label }), element("dd", { text: displayDetailValue(value, type) }));
+    const displayValue = record.category === "relationship" && key === "kind" ? relationshipKind(value)?.label || friendly(value) : displayDetailValue(value, type);
+    const content = record.category === "project" && key === "githubLink"
+      ? element("a", { class: "external-link", href: value, target: "_blank", rel: "noopener noreferrer" }, ["Open on GitHub", icon("external")])
+      : displayValue;
+    properties.append(element("dt", { text: label }), element("dd", {}, content));
   });
-  properties.append(element("dt", { text: "Updated" }), element("dd", { text: formatTimestamp(record.updatedAt) }), element("dt", { text: "Revision" }), element("dd", { text: String(record.revision || 1) }));
   root.append(detailSection("Details", null, properties));
 
   if (record.category === "person") {
@@ -887,15 +956,33 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
 
   if (record.category === "experience") root.append(renderExperienceGallery(record));
 
-  const customList = element("dl", { class: "property-list" });
+  const customList = element("div", { class: "custom-field-list" });
   const customValues = record.customFieldValues || {};
-  state.customFields.forEach((field) => {
+  state.customFields.filter((field) => !field.archived || Object.hasOwn(customValues, field.id)).forEach((field) => {
     const value = customValues[field.id];
-    if (value === undefined || value === "") return;
-    customList.append(element("dt", { text: field.name }), element("dd", { text: typeof value === "boolean" ? (value ? "Yes" : "No") : String(value) }));
+    const hasValue = value !== undefined && value !== "";
+    const valueLabel = hasValue ? (typeof value === "boolean" ? (value ? "Yes" : "No") : String(value)) : "Not set";
+    const fieldCopy = element("div", { class: "custom-field-copy" }, [
+      element("div", { class: "custom-field-name" }, [
+        element("strong", { text: field.name }),
+        field.archived ? element("span", { class: "archived-badge", text: "Archived" }) : null
+      ]),
+      element("span", { class: hasValue ? "" : "is-empty", text: valueLabel })
+    ]);
+    const remove = !record.trashed && !record.deletedAt
+      ? element("button", {
+        class: "compact-delete",
+        type: "button",
+        title: `Delete ${field.name}`,
+        "aria-label": `Delete custom field ${field.name}`,
+        onclick: (event) => deleteCustomField(field, event.currentTarget)
+      }, icon("trash"))
+      : null;
+    customList.append(element("div", { class: `custom-field-item${field.archived ? " is-archived" : ""}` }, [fieldCopy, remove]));
   });
-  if (!customList.childNodes.length) customList.append(element("p", { class: "detail-empty", text: "No custom values on this entry." }));
-  root.append(detailSection("Custom fields", element("button", { class: "text-button", type: "button", text: "Add field", onclick: openFieldDialog }), customList));
+  if (!customList.childNodes.length) customList.append(element("p", { class: "detail-empty", text: "No custom fields in this category yet." }));
+  const addField = !record.trashed && !record.deletedAt ? element("button", { class: "text-button", type: "button", text: "Add field", onclick: openFieldDialog }) : null;
+  root.append(detailSection("Custom fields", addField, customList));
 
   const linked = element("div", { class: "linked-list" });
   const links = [...(record.links || []).map((link) => ({ ...link, direction: "out" })), ...(record.backlinks || []).map((link) => ({ ...link, direction: "in" }))];
@@ -903,15 +990,33 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
   links.forEach((link) => {
     const targetId = link.direction === "out" ? link.targetId : link.sourceId;
     const target = link.target || link.source || state.allRecords.find((item) => item.id === targetId);
+    const targetTitle = target ? recordTitle(target) : "linked entry";
+    const targetMeta = target ? (CATEGORIES[target.category] || CATEGORIES.resource) : null;
+    const targetRelationshipMeta = target?.category === "relationship" ? relationshipKind(target.data?.kind) : null;
+    const targetIcon = targetRelationshipMeta?.icon || targetMeta?.icon || "link";
+    const targetAccent = targetRelationshipMeta?.accent || targetMeta?.accent;
     linked.append(element("div", { class: "linked-item" }, [
-      element("span", {}, icon("link")), element("div", { class: "linked-copy" }, [element("strong", { text: target ? recordTitle(target) : "Linked entry" }), element("small", { text: `${link.direction === "in" ? "Linked here" : "Links to"}${link.label ? ` · ${link.label}` : ""}` })]),
-      targetId ? element("button", { class: "icon-button", type: "button", "aria-label": "Open linked entry", onclick: () => openDetail(targetId) }, icon("chevron")) : null
+      element("span", { style: targetAccent ? { "--record-accent": targetAccent } : {} }, icon(targetIcon)), element("div", { class: "linked-copy" }, [element("strong", { text: targetTitle }), element("small", { text: `${link.direction === "in" ? "Linked here" : "Links to"}${link.label ? ` · ${link.label}` : ""}` })]),
+      element("div", { class: "linked-actions" }, [
+        !record.trashed && !record.deletedAt ? element("button", {
+          class: "compact-delete",
+          type: "button",
+          title: `Delete link to ${targetTitle}`,
+          "aria-label": `Delete cross-link to ${targetTitle}`,
+          onclick: (event) => deleteCrossLink(link, targetTitle, event.currentTarget)
+        }, icon("trash")) : null,
+        targetId ? element("button", { class: "icon-button compact-open", type: "button", "aria-label": `Open ${targetTitle}`, onclick: () => openDetail(targetId) }, icon("chevron")) : null
+      ])
     ]));
   });
-  root.append(detailSection("Cross-links", element("button", { class: "text-button", type: "button", text: "Add link", onclick: openLinkDialog }), linked));
+  const addLink = !record.trashed && !record.deletedAt ? element("button", { class: "text-button", type: "button", text: "Add link", onclick: openLinkDialog }) : null;
+  root.append(detailSection("Cross-links", addLink, linked));
 
   const revisions = element("div", { class: "revision-list", id: "revision-list" }, element("p", { class: "detail-empty", text: "Loading history…" }));
-  root.append(detailSection("Revision history", null, revisions));
+  root.append(element("details", { class: "detail-section revision-section" }, [
+    element("summary", { class: "detail-section-head" }, [element("h3", { text: "Revision history" }), element("span", { class: "revision-chevron" }, icon("chevron"))]),
+    revisions
+  ]));
   loadRevisions(record.id, revisions);
 
   if (!fullPage) {
@@ -1030,7 +1135,8 @@ async function openRecordDialog(record = null) {
   const fields = $("#record-fields");
   fields.replaceChildren();
   (FIELD_DEFS[category] || []).forEach((definition) => {
-    const value = definition[0] === "title" ? record?.title : category === "person" ? personData(record)[definition[0]] : record?.data?.[definition[0]];
+    let value = definition[0] === "title" ? record?.title : category === "person" ? personData(record)[definition[0]] : record?.data?.[definition[0]];
+    if (!record && category === "relationship" && definition[0] === "kind" && relationshipKind(state.filter)) value = state.filter;
     fields.append(inputForDefinition(definition, value ?? ""));
   });
   if (category === "person") {
@@ -1175,6 +1281,27 @@ async function saveLink(event) {
   } catch (error) { notify(error.message, "error"); }
 }
 
+async function refreshSelectedDetail({ reloadFields = false } = {}) {
+  const id = state.selected?.id;
+  if (!id) return;
+  if (reloadFields) state.customFieldsCategory = null;
+  if (state.detailMode === "page") await openFullPageDetail(id);
+  else await openDetail(id, { fromRoute: true });
+}
+
+async function deleteCrossLink(link, targetTitle, button) {
+  if (!window.confirm(`Delete the cross-link to “${targetTitle}”?`)) return;
+  setIconButtonBusy(button, true);
+  try {
+    await api(`/links/${encodeURIComponent(link.id)}`, { method: "DELETE" });
+    notify("Cross-link deleted.", "success");
+    await refreshSelectedDetail();
+  } catch (error) {
+    notify(error.message, "error");
+    setIconButtonBusy(button, false);
+  }
+}
+
 function openFieldDialog() {
   const form = $("#field-form");
   form.reset();
@@ -1199,6 +1326,38 @@ async function saveField(event) {
     await loadCategory();
     if (state.selected) await openDetail(state.selected.id);
   } catch (error) { notify(error.message, "error"); }
+}
+
+async function deleteCustomField(field, button) {
+  if (!window.confirm(`Permanently delete the custom field “${field.name}”? All of its values, including revision history, will be removed. This cannot be undone.`)) return;
+  setIconButtonBusy(button, true);
+  try {
+    await api(`/custom-fields/${encodeURIComponent(field.id)}`, { method: "DELETE" });
+    notify("Custom field permanently deleted.", "success");
+    await refreshSelectedDetail({ reloadFields: true });
+  } catch (error) {
+    notify(error.message, "error");
+    setIconButtonBusy(button, false);
+  }
+}
+
+async function emptyTrash() {
+  const count = state.records.length;
+  if (!count || !window.confirm(`Permanently delete ${count} ${count === 1 ? "entry" : "entries"}? Their history, links, and attachments will also be deleted. This cannot be undone.`)) return;
+  const button = $("#empty-trash");
+  const label = $("#empty-trash-label");
+  button.disabled = true;
+  label.textContent = "Cleaning up…";
+  try {
+    const result = await api("/trash", { method: "DELETE" });
+    notify(`${result.deleted} ${result.deleted === 1 ? "entry" : "entries"} permanently deleted.`, "success");
+    await Promise.all([loadCategory(), refreshCounts()]);
+  } catch (error) {
+    notify(error.message, "error");
+  } finally {
+    button.disabled = false;
+    label.textContent = "Clean up";
+  }
 }
 
 function openBackupDialog() {
@@ -1282,7 +1441,7 @@ async function importBackup() {
 function openPromptDialog() {
   const prompts = [
     { category: "person", icon: "person", title: "A profile to complete", recordTitle: "My legal name", description: "Create a blank personal portrait.", data: { preferredName: "", gender: "", birthDate: "", birthPlace: "", nationalities: [], languages: [], maritalStatus: "", emails: [], phoneNumbers: [], address: "", summary: "", notes: "" } },
-    { category: "goal", icon: "compass", title: "A direction to name", recordTitle: "An intention to define", description: "Hold a place for one active intention.", data: { horizon: "short", status: "active", targetDate: "", progressNote: "", motivation: "" } },
+    { category: "goal", icon: "compass", title: "A direction to name", recordTitle: "An intention to define", description: "Hold a place for one intention.", data: { horizon: "short", targetDate: "", progressNote: "", motivation: "" } },
     { category: "resource", icon: "bookmark", title: "Something useful", recordTitle: "A useful resource", description: "Save a place for a resource you rely on.", data: { kind: "other", ownership: "", access: "", availability: "available", quantity: "", unit: "", notes: "" } }
   ];
   const root = $("#prompt-options");
@@ -1365,6 +1524,7 @@ function wireEvents() {
   $("#detail-edit").addEventListener("click", () => state.selected && openRecordDialog(state.selected));
   $("#detail-remove").addEventListener("click", removeOrRestore);
   $("#trash-button").addEventListener("click", async () => { await navigateTo({ kind: "trash", category: state.category }); });
+  $("#empty-trash").addEventListener("click", emptyTrash);
   $("#backup-button").addEventListener("click", () => { closeSidebar(); openBackupDialog(); });
   $("#lock-button").addEventListener("click", lockAtlas);
   $("#open-sidebar").addEventListener("click", openSidebar);

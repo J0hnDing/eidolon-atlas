@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Atlas, IMAGE_MAX_BYTES, IMAGE_MAX_PER_EXPERIENCE } from '../src/atlas.js';
-import { createBackupEnvelope, openBackupEnvelope } from '../src/crypto.js';
+import { createBackupEnvelope, deriveKey, encryptJson, objectAad, openBackupEnvelope } from '../src/crypto.js';
 import { createServer, listen } from '../src/server.js';
 
 const APP_PASSPHRASE = 'correct horse battery staple';
@@ -33,15 +33,27 @@ test('category contracts and person singleton are enforced', async (t) => {
   assert.throws(() => create(atlas, 'person', 'Duplicate', {}), { code: 'PERSON_EXISTS' });
   assert.throws(() => create(atlas, 'experience', 'Bad period', { kind: 'period', startDate: '2026-13' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'experience', 'Bad ongoing', { kind: 'period', startDate: '2026', endDate: '2026-02', ongoing: true }), { code: 'VALIDATION_ERROR' });
-  assert.throws(() => create(atlas, 'goal', 'Bad goal', { horizon: 'someday', status: 'active' }), { code: 'VALIDATION_ERROR' });
-  assert.throws(() => create(atlas, 'project', 'Bad project', { context: '', currentState: '', budget: 1 }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'goal', 'Bad goal', { horizon: 'someday' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'goal', 'Goal with status', { horizon: 'short', status: 'active' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'project', 'Old state field', { context: '', status: 'active', githubLink: '', currentState: '' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'project', 'Bad status', { context: '', status: 'in_progress', githubLink: '' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'project', 'Bad link', { context: '', status: 'active', githubLink: 'github.com/example/repo' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'resource', 'Cash', { quantity: 1, value: 10 }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'relationship', 'Unknown', { kind: 'place' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'relationship', 'Old person kind', { kind: 'person' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'preference', 'Theme', {}), { code: 'VALIDATION_ERROR' });
   assert.equal(create(atlas, 'experience', 'Launch', { kind: 'event', startDate: '2026-08-04' }).revision, 1);
-  assert.equal(create(atlas, 'project', 'Atlas', { context: '', currentState: 'active' }).category, 'project');
+  const project = create(atlas, 'project', 'Atlas', { context: '', status: 'active', githubLink: 'https://github.com/example/atlas' });
+  assert.equal(project.category, 'project');
+  assert.deepEqual(project.data, { context: '', status: 'active', githubLink: 'https://github.com/example/atlas' });
+  for (const status of ['planned', 'paused', 'completed', 'abandoned']) {
+    assert.equal(create(atlas, 'project', status, { context: '', status, githubLink: '' }).data.status, status);
+  }
   assert.equal(create(atlas, 'resource', 'Workshop', { kind: 'capital', availability: 'available' }).category, 'resource');
   assert.equal(create(atlas, 'relationship', 'Studio', { kind: 'org' }).category, 'relationship');
+  for (const kind of ['family', 'partner', 'friend', 'acquaintance', 'coworker', 'mentor']) {
+    assert.equal(create(atlas, 'relationship', kind, { kind }).data.kind, kind);
+  }
 });
 
 test('numbered migrations are idempotent across reopen', async (t) => {
@@ -57,6 +69,34 @@ test('numbered migrations are idempotent across reopen', async (t) => {
   reopened.close();
   await rm(directory, { recursive: true, force: true });
   t.after(() => rm(directory, { recursive: true, force: true }));
+});
+
+test('unlock migrates the removed person relationship kind to family once', async (t) => {
+  const { atlas } = await fixture(t);
+  const relationship = create(atlas, 'relationship', 'Parent', { kind: 'family', relationshipType: 'Mother' });
+  const config = JSON.parse(atlas.database.prepare("SELECT value FROM metadata WHERE key = 'encryption-config'").get().value);
+  const salt = Buffer.from(config.salt, 'base64');
+  delete config.salt;
+  const key = await deriveKey(APP_PASSPHRASE, salt, config);
+  const legacyContent = {
+    title: relationship.title,
+    data: { ...relationship.data, kind: 'person' },
+    customFieldValues: relationship.customFieldValues,
+  };
+  atlas.database.prepare('UPDATE records SET payload = ? WHERE id = ?').run(
+    encryptJson(key, legacyContent, objectAad('record', relationship.id, relationship.revision, relationship.category)),
+    relationship.id,
+  );
+  key.fill(0);
+
+  atlas.lock();
+  await atlas.unlock(APP_PASSPHRASE);
+  const migrated = atlas.getRecord(relationship.id);
+  assert.equal(migrated.data.kind, 'family');
+  assert.equal(migrated.revision, 2);
+  atlas.lock();
+  await atlas.unlock(APP_PASSPHRASE);
+  assert.equal(atlas.getRecord(relationship.id).revision, 2);
 });
 
 test('user content is encrypted and tampering and wrong passphrases fail closed', async (t) => {
@@ -86,15 +126,15 @@ test('locking removes access to protected operations', async (t) => {
 
 test('goal sibling order, moves, cycle rejection, and conservative trash remain coherent', async (t) => {
   const { atlas } = await fixture(t);
-  const first = create(atlas, 'goal', 'First', { horizon: 'short', status: 'active' });
-  const second = create(atlas, 'goal', 'Second', { horizon: 'short', status: 'active' }, { position: 0 });
+  const first = create(atlas, 'goal', 'First', { horizon: 'short' });
+  const second = create(atlas, 'goal', 'Second', { horizon: 'short' }, { position: 0 });
   assert.deepEqual(atlas.listRecords({ category: 'goal' }).map((goal) => [goal.title, goal.position]), [
     ['Second', 0], ['First', 1],
   ]);
   const moved = atlas.patchRecord(first.id, { revision: first.revision, position: 0 });
   assert.equal(moved.position, 0);
   assert.deepEqual(atlas.listRecords({ category: 'goal' }).map((goal) => goal.title), ['First', 'Second']);
-  const child = create(atlas, 'goal', 'Child', { horizon: 'short', status: 'active' }, { parentId: first.id });
+  const child = create(atlas, 'goal', 'Child', { horizon: 'short' }, { parentId: first.id });
   assert.throws(() => atlas.patchRecord(first.id, { revision: moved.revision, parentId: child.id }), { code: 'GOAL_CYCLE' });
   assert.throws(() => atlas.trashRecord(first.id, moved.revision), { code: 'GOAL_HAS_ACTIVE_CHILDREN' });
   const trashedChild = atlas.trashRecord(child.id, child.revision);
@@ -121,27 +161,64 @@ test('typed custom fields and encrypted links are included in record detail', as
   const { atlas, databasePath } = await fixture(t);
   const field = atlas.createCustomField({ category: 'person', name: 'Favorite color', type: 'singleChoice', options: ['blue', 'green'] });
   const person = atlas.createRecord({ category: 'person', title: 'Me', data: {}, customFieldValues: { [field.id]: 'blue' } });
-  const archived = atlas.deleteCustomField(field.id);
-  assert.equal(archived.archived, true);
-  assert.equal(atlas.listCustomFields({ category: 'person' })[0].archived, true);
+  const deletedField = atlas.deleteCustomField(field.id);
+  assert.equal(deletedField.deleted, true);
+  assert.equal(deletedField.recordsUpdated, 1);
+  assert.equal(deletedField.revisionsUpdated, 1);
+  assert.equal(atlas.listCustomFields({ category: 'person' }).length, 0);
+  assert.deepEqual(atlas.getRecord(person.id).customFieldValues, {});
+  assert.deepEqual(atlas.listRevisions(person.id)[0].customFieldValues, {});
   assert.equal(atlas.listCustomFields({ category: 'goal' }).length, 0);
   assert.throws(() => atlas.patchRecord(person.id, {
     revision: person.revision, customFieldValues: { [field.id]: 'green' },
-  }), { code: 'CUSTOM_FIELD_ARCHIVED' });
+  }), { code: 'VALIDATION_ERROR' });
   const renamed = atlas.patchRecord(person.id, { revision: person.revision, title: 'Me again' });
   assert.equal(renamed.title, 'Me again');
   assert.throws(() => atlas.patchRecord(person.id, { revision: renamed.revision,
-    customFieldValues: { [field.id]: 'green' } }), { code: 'CUSTOM_FIELD_ARCHIVED' });
+    customFieldValues: { [field.id]: 'green' } }), { code: 'VALIDATION_ERROR' });
   const preference = create(atlas, 'preference', 'Color', { value: 'blue' });
   const link = atlas.createLink({ sourceId: person.id, targetId: preference.id, type: 'supports', label: 'explains', notes: 'private note' });
   assert.equal(atlas.getRecord(person.id).links[0].label, 'explains');
   assert.equal(atlas.getRecord(preference.id).backlinks[0].id, link.id);
+  assert.deepEqual(atlas.deleteLink(link.id), { deleted: true });
+  assert.equal(atlas.getRecord(person.id).links.length, 0);
+  assert.equal(atlas.getRecord(preference.id).backlinks.length, 0);
   assert.throws(() => atlas.createLink({ sourceId: person.id, targetId: person.id }), { code: 'VALIDATION_ERROR' });
   atlas.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   const bytes = await readFile(databasePath);
   for (const privateText of ['Favorite color', 'explains', 'private note']) {
     assert.equal(bytes.includes(Buffer.from(privateText)), false);
   }
+});
+
+test('unused custom fields are deleted rather than archived', async (t) => {
+  const { atlas } = await fixture(t);
+  const field = atlas.createCustomField({ category: 'goal', name: 'Theme', type: 'text' });
+  const result = atlas.deleteCustomField(field.id);
+  assert.equal(result.deleted, true);
+  assert.equal(result.recordsUpdated, 0);
+  assert.equal(result.revisionsUpdated, 0);
+  assert.equal(atlas.listCustomFields({ category: 'goal' }).length, 0);
+  assert.throws(() => atlas.deleteCustomField(field.id), { code: 'CUSTOM_FIELD_NOT_FOUND' });
+});
+
+test('empty trash permanently deletes records and cascades their related data', async (t) => {
+  const { atlas } = await fixture(t);
+  const removed = create(atlas, 'preference', 'Temporary', { value: 'remove me' });
+  const retained = create(atlas, 'preference', 'Keep', { value: 'stay' });
+  const parent = create(atlas, 'goal', 'Removed parent', { horizon: 'short' });
+  const child = create(atlas, 'goal', 'Removed child', { horizon: 'short' }, { parentId: parent.id });
+  atlas.createLink({ sourceId: retained.id, targetId: removed.id, label: 'temporary link' });
+  atlas.trashRecord(removed.id, removed.revision);
+  atlas.trashRecord(child.id, child.revision);
+  atlas.trashRecord(parent.id, parent.revision);
+
+  assert.deepEqual(atlas.emptyTrash(), { deleted: 3 });
+  assert.deepEqual(atlas.emptyTrash(), { deleted: 0 });
+  assert.deepEqual(atlas.listRecords({ trashed: 'all' }).map((record) => record.id), [retained.id]);
+  assert.equal(atlas.getRecord(retained.id).links.length, 0);
+  assert.throws(() => atlas.getRecord(removed.id), { code: 'RECORD_NOT_FOUND' });
+  assert.equal(atlas.database.prepare('SELECT COUNT(*) AS count FROM record_revisions WHERE record_id = ?').get(removed.id).count, 0);
 });
 
 test('person predefined fields validate without rejecting legacy-compatible data', async (t) => {

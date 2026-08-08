@@ -118,6 +118,7 @@ export class Atlas {
       throw error;
     }
     this.#replaceKey(key);
+    this.#migrateRelationshipKinds();
     return this.status();
   }
 
@@ -365,13 +366,48 @@ export class Atlas {
   deleteCustomField(id) {
     this.#requireUnlocked();
     const row = this.#customFieldRow(id);
-    if (this.#customFieldReferenced(id)) {
-      this.#db.prepare('UPDATE custom_fields SET archived = 1, updated_at = ? WHERE id = ?').run(now(), id);
-      return { deleted: false, archived: true,
-        field: this.#customFieldFromRow(this.#db.prepare('SELECT * FROM custom_fields WHERE id = ?').get(id)) };
-    }
-    this.#db.prepare('DELETE FROM custom_fields WHERE id = ?').run(id);
-    return { deleted: true, archived: false, field: this.#customFieldFromRow(row) };
+    const field = this.#customFieldFromRow(row);
+    let recordsUpdated = 0;
+    let revisionsUpdated = 0;
+    transaction(this.#db, () => {
+      const recordRows = this.#db.prepare('SELECT * FROM records WHERE category = ?').all(field.category);
+      for (const recordRow of recordRows) {
+        const record = this.#recordFromRow(recordRow);
+        if (!Object.hasOwn(record.customFieldValues, id)) continue;
+        const customFieldValues = { ...record.customFieldValues };
+        delete customFieldValues[id];
+        const snapshot = this.#snapshotFromRecord({ ...record, customFieldValues });
+        this.#db.prepare('UPDATE records SET payload = ? WHERE id = ?').run(
+          this.#encryptRecord(record.id, record.revision, record.category, snapshot), record.id,
+        );
+        recordsUpdated += 1;
+      }
+      const revisionRows = this.#db.prepare('SELECT * FROM record_revisions WHERE category = ?').all(field.category);
+      for (const revisionRow of revisionRows) {
+        const snapshot = decryptJson(this.#key, revisionRow.payload,
+          objectAad('revision', revisionRow.record_id, revisionRow.revision, revisionRow.category));
+        if (!Object.hasOwn(snapshot.customFieldValues ?? {}, id)) continue;
+        const customFieldValues = { ...(snapshot.customFieldValues ?? {}) };
+        delete customFieldValues[id];
+        const payload = encryptJson(this.#key, { ...snapshot, customFieldValues },
+          objectAad('revision', revisionRow.record_id, revisionRow.revision, revisionRow.category));
+        this.#db.prepare('UPDATE record_revisions SET payload = ? WHERE record_id = ? AND revision = ?')
+          .run(payload, revisionRow.record_id, revisionRow.revision);
+        revisionsUpdated += 1;
+      }
+      this.#db.prepare('DELETE FROM custom_fields WHERE id = ?').run(id);
+    });
+    return { deleted: true, field, recordsUpdated, revisionsUpdated };
+  }
+
+  emptyTrash() {
+    this.#requireUnlocked();
+    const { count } = this.#db.prepare('SELECT COUNT(*) AS count FROM records WHERE trashed = 1').get();
+    if (!count) return { deleted: 0 };
+    transaction(this.#db, () => {
+      this.#db.prepare('DELETE FROM records WHERE trashed = 1').run();
+    });
+    return { deleted: count };
   }
 
   createLink(input) {
@@ -999,6 +1035,16 @@ export class Atlas {
       position: record.position ?? 0, trashed: Boolean(record.trashed) };
   }
 
+  #migrateRelationshipKinds() {
+    for (const record of this.listRecords({ category: 'relationship', trashed: 'all' })) {
+      if (record.data?.kind !== 'person') continue;
+      this.patchRecord(record.id, {
+        revision: record.revision,
+        data: { ...record.data, kind: 'family' },
+      });
+    }
+  }
+
   #encryptRecord(id, revision, category, snapshot) {
     const content = { title: snapshot.title, data: snapshot.data, customFieldValues: snapshot.customFieldValues };
     return encryptJson(this.#key, content, objectAad('record', id, revision, category));
@@ -1065,16 +1111,6 @@ export class Atlas {
       }
       validateCustomFieldValue(field, value);
     }
-  }
-
-  #customFieldReferenced(id) {
-    if (this.listRecords({ trashed: 'all' }).some((record) => Object.hasOwn(record.customFieldValues, id))) return true;
-    for (const row of this.#db.prepare('SELECT * FROM record_revisions').iterate()) {
-      const snapshot = decryptJson(this.#key, row.payload,
-        objectAad('revision', row.record_id, row.revision, row.category));
-      if (Object.hasOwn(snapshot.customFieldValues ?? {}, id)) return true;
-    }
-    return false;
   }
 
   #validateGoalParent(id, parentId) {

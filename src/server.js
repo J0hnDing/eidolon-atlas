@@ -179,6 +179,9 @@ async function routeApi(atlas, request, response, url, limits) {
   if (method === 'POST' && path === '/api/records') {
     return sendJson(response, 201, atlas.createRecord(await readJson(request, limits.body)));
   }
+  if (method === 'DELETE' && path === '/api/trash') {
+    return sendJson(response, 200, atlas.emptyTrash());
+  }
   let match = /^\/api\/records\/([^/]+)\/images$/.exec(path);
   if (match) {
     const recordId = decodeSegment(match[1]);

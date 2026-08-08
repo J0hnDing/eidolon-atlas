@@ -6,9 +6,17 @@ export const CATEGORIES = Object.freeze([
 export const CUSTOM_FIELD_TYPES = Object.freeze([
   'text', 'longText', 'number', 'boolean', 'date', 'url', 'singleChoice',
 ]);
+export const RELATIONSHIP_KINDS = Object.freeze([
+  'family', 'partner', 'friend', 'acquaintance', 'coworker', 'mentor', 'org',
+]);
+export const PROJECT_STATUSES = Object.freeze([
+  'planned', 'active', 'paused', 'completed', 'abandoned',
+]);
 
 const CATEGORY_SET = new Set(CATEGORIES);
 const FIELD_TYPE_SET = new Set(CUSTOM_FIELD_TYPES);
+const RELATIONSHIP_KIND_SET = new Set(RELATIONSHIP_KINDS);
+const PROJECT_STATUS_SET = new Set(PROJECT_STATUSES);
 const PARTIAL_DATE = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/;
 const PERSON_STRING_FIELDS = Object.freeze([
   'preferredName', 'gender', 'birthPlace', 'maritalStatus', 'address', 'summary', 'notes',
@@ -116,17 +124,25 @@ function validateCategoryData(category, data) {
     if (!['short', 'middle', 'long'].includes(data.horizon)) {
       fail(400, 'VALIDATION_ERROR', 'Goal horizon must be short, middle, or long.');
     }
-    if (!['planned', 'active', 'paused', 'completed', 'abandoned'].includes(data.status)) {
-      fail(400, 'VALIDATION_ERROR', 'Goal status is invalid.');
+    if (Object.hasOwn(data, 'status')) {
+      fail(400, 'VALIDATION_ERROR', 'Goal data.status is not supported.');
     }
   }
   if (category === 'project') {
-    const unexpected = Object.keys(data).filter((key) => !['context', 'currentState'].includes(key));
+    const unexpected = Object.keys(data).filter((key) => !['context', 'status', 'githubLink'].includes(key));
     if (unexpected.length) {
-      fail(400, 'VALIDATION_ERROR', 'Project data supports only context and currentState.', { fields: unexpected });
+      fail(400, 'VALIDATION_ERROR', 'Project data supports only context, status, and githubLink.', { fields: unexpected });
     }
     requireString(data.context, 'Project context', { allowEmpty: true });
-    requireString(data.currentState, 'Project currentState', { allowEmpty: true });
+    if (!PROJECT_STATUS_SET.has(data.status)) {
+      fail(400, 'VALIDATION_ERROR', 'Project status is invalid.');
+    }
+    requireString(data.githubLink, 'Project githubLink', { allowEmpty: true });
+    if (data.githubLink) {
+      let valid = false;
+      try { valid = ['http:', 'https:'].includes(new URL(data.githubLink).protocol); } catch { /* invalid */ }
+      if (!valid) fail(400, 'VALIDATION_ERROR', 'Project githubLink must be an HTTP(S) URL.');
+    }
   }
   if (category === 'resource') {
     const forbidden = ['value', 'values', 'amount', 'currency', 'price', 'ledger', 'transactions'];
@@ -135,8 +151,8 @@ function validateCategoryData(category, data) {
       fail(400, 'VALIDATION_ERROR', 'Resources are inventory records and cannot contain financial values or a ledger.', { fields: found });
     }
   }
-  if (category === 'relationship' && !['person', 'org', 'organization'].includes(data.kind)) {
-    fail(400, 'VALIDATION_ERROR', 'Relationship data.kind must be person or org.');
+  if (category === 'relationship' && !RELATIONSHIP_KIND_SET.has(data.kind)) {
+    fail(400, 'VALIDATION_ERROR', `Relationship data.kind must be one of: ${RELATIONSHIP_KINDS.join(', ')}.`);
   }
   if (category === 'preference' && !Object.hasOwn(data, 'value')) {
     fail(400, 'VALIDATION_ERROR', 'Preference data.value is required.');

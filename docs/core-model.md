@@ -26,16 +26,16 @@ may also carry encrypted JPEG, PNG, or WebP images, up to 20 MiB per image and
 
 ### Goal
 
-A Goal has a short-, middle-, or long-term horizon and a lifecycle status.
+A Goal has a short-, middle-, or long-term horizon.
 Goals form an ordered parent/subgoal tree. A goal has at most one parent;
 cycles are invalid; sibling order is explicit. This hierarchy is separate from
 ordinary cross-record links.
 
 ### Project
 
-A Project preserves context, dates, outcome, status, and a brief current-state
-note. Atlas does not provide project tasks, milestones, assignments, or
-workflow automation.
+A Project preserves context, a lifecycle status (planned, active, paused,
+completed, or abandoned), and an optional GitHub link. Atlas does not provide
+project tasks, milestones, assignments, or workflow automation.
 
 ### Resource
 
@@ -45,9 +45,11 @@ inventory, not a financial ledger: v1 stores no valuations or transactions.
 
 ### Relationships
 
-A Relationship represents another person or organization together with the
+A Relationship belongs to one predefined category: Family, Partner/Spouse,
+Friends, Acquaintances, Coworkers, Mentors, or Organizations. It records the
 owner's relationship type, status, importance, dates, contact details, and
-notes. Shared experiences and projects are ordinary links.
+notes. Shared experiences and projects are ordinary links. The Relationships
+landing page presents these categories before opening an individual category.
 
 ### Preference
 
@@ -61,18 +63,23 @@ They are navigable in both directions but do not change category ownership or
 goal parentage.
 
 Each category can define custom fields of type text, long text, number,
-Boolean, date, URL, or single choice. A definition with stored values is
-archived rather than destroyed.
+Boolean, date, URL, or single choice. Deleting a custom field permanently
+removes its definition and all of its values from current and historical
+record snapshots.
 
 ## Revisions and trash
 
-Every meaningful mutation creates an immutable revision. Restoring an older
-revision creates a new current revision; history is never rewritten. No-op
-edits do not create revisions.
+Ordinary record mutations create immutable revisions. Restoring an older
+revision creates a new current revision; no-op edits do not create revisions.
+Permanently deleting a custom field is the explicit exception: its values are
+purged from every revision so the deleted field does not survive in history.
 
 Trashing is reversible. A goal with active subgoals cannot be trashed until
 those children are moved or trashed. Links remain associated with a trashed
 record and become visible again if it is restored.
+
+Cleaning up Recently Removed permanently deletes every trashed record together
+with its revision history, links, and attachments. This cannot be undone.
 
 Experience attachments are independent of record revisions: adding or removing
 an image does not create a record revision. Attachments remain available while

@@ -23,3 +23,29 @@ Replaced Person contact/status blocks with validated predefined and repeatable p
 ### Limitations
 
 Images preserve originals without thumbnails, captions, or manual ordering; staged v2 uploads are bounded at 2 GiB. Automated browser-window QA could not complete because both local browser-control helpers failed, though syntax, HTTP, deep-link, encryption, limit, and tamper tests passed.
+
+## 2026-08-07 20:11 — Add relationship categories and category landing page
+
+- Category: feature
+- Area: Relationships
+
+### Summary
+
+Replaced the broad person relationship kind with Family, Partner/Spouse, Friends, Acquaintances, Coworkers, Mentors, and Organizations; added a boxed category overview with drill-down views; added one-time person-to-Family migration, tests, and core model documentation.
+
+### Limitations
+
+The already-running Atlas server must be restarted and unlocked once before the encrypted relationship migration executes. Automated visual browser inspection was unavailable because local window connectors could not attach; syntax, domain behavior, migration behavior, and the full test suite were verified.
+
+## 2026-08-07 23:52 — Move lifecycle status from Goals to Projects and add GitHub links
+
+- Category: feature
+- Area: Goals and Projects
+
+### Summary
+
+Removed the built-in Goal status field and its status filters; added the planned, active, paused, completed, and abandoned lifecycle status contract and filters to Projects; removed Project currentState; added an optional validated GitHub Link field with a one-click external link in project details; updated tests and core model documentation.
+
+### Limitations
+
+No migration or backward compatibility was added for existing Goal status or Project currentState data, as requested. Automated visual browser inspection was not run; syntax checks and the full automated test suite passed.
