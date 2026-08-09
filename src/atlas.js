@@ -30,6 +30,18 @@ function integerPosition(value) {
   return value;
 }
 
+function goalDataWithoutLegacyText(data) {
+  if (!Object.hasOwn(data ?? {}, 'progressNote') && !Object.hasOwn(data ?? {}, 'motivation')) return data;
+  const next = { ...(data ?? {}) };
+  const descriptions = [next.description, next.motivation, next.progressNote]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .filter((value, index, values) => values.indexOf(value) === index);
+  next.description = descriptions.join('\n\n');
+  delete next.progressNote;
+  delete next.motivation;
+  return next;
+}
+
 function imageType(bytes) {
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
@@ -119,6 +131,7 @@ export class Atlas {
     }
     this.#replaceKey(key);
     this.#migrateRelationshipKinds();
+    this.#migrateGoalTextFields();
     return this.status();
   }
 
@@ -187,8 +200,68 @@ export class Atlas {
     if (includeConnections) {
       record.links = this.#linksFor(id, true);
       record.backlinks = this.#linksFor(id, false);
+      if (record.category === 'goal' && record.parentId) {
+        const parentRow = this.#db.prepare("SELECT * FROM records WHERE id = ? AND category = 'goal'").get(record.parentId);
+        record.parentGoal = parentRow ? this.#recordFromRow(parentRow) : null;
+      }
     }
     return record;
+  }
+
+  getGoalGraph(id) {
+    this.#requireUnlocked();
+    const goal = this.#goalRecord(id);
+    const nodes = this.#db.prepare("SELECT * FROM records WHERE category = 'goal' AND parent_id = ? AND trashed = 0 ORDER BY position")
+      .all(id).map((row) => this.#recordFromRow(row));
+    const nodeIds = new Set(nodes.map((node) => node.id));
+    const dependencies = this.#db.prepare(`SELECT goal_id, prerequisite_id, created_at FROM goal_dependencies
+      WHERE goal_id IN (SELECT id FROM records WHERE parent_id = ? AND trashed = 0)
+      ORDER BY created_at, goal_id, prerequisite_id`).all(id)
+      .filter((edge) => nodeIds.has(edge.prerequisite_id))
+      .map((edge) => ({ goalId: edge.goal_id, prerequisiteId: edge.prerequisite_id, createdAt: edge.created_at }));
+    return {
+      goal: { ...goal, progress: this.#goalProgress(goal.id) },
+      nodes: nodes.map((node) => ({ ...node, progress: this.#goalProgress(node.id),
+        hasSubgoals: Boolean(this.#db.prepare("SELECT 1 FROM records WHERE category = 'goal' AND parent_id = ? AND trashed = 0 LIMIT 1").get(node.id)) })),
+      dependencies,
+    };
+  }
+
+  createGoalDependency(goalId, prerequisiteId) {
+    this.#requireUnlocked();
+    if (typeof prerequisiteId !== 'string' || !prerequisiteId) {
+      fail(400, 'VALIDATION_ERROR', 'prerequisiteId must identify a goal.');
+    }
+    const goal = this.#goalRecord(goalId);
+    const prerequisite = this.#goalRecord(prerequisiteId);
+    if (goal.trashed || prerequisite.trashed) fail(409, 'GOAL_TRASHED', 'Removed goals cannot participate in progression.');
+    if (!goal.parentId || goal.parentId !== prerequisite.parentId) {
+      fail(400, 'INVALID_GOAL_DEPENDENCY', 'A prerequisite must be a sibling subgoal in the same progression.');
+    }
+    if (goal.id === prerequisite.id) fail(409, 'GOAL_DEPENDENCY_CYCLE', 'A subgoal cannot depend on itself.');
+    const duplicate = this.#db.prepare('SELECT 1 FROM goal_dependencies WHERE goal_id = ? AND prerequisite_id = ?').get(goal.id, prerequisite.id);
+    if (duplicate) fail(409, 'GOAL_DEPENDENCY_EXISTS', 'This prerequisite already exists.');
+    const reachable = new Set([goal.id]);
+    const queue = [goal.id];
+    while (queue.length) {
+      const current = queue.shift();
+      for (const row of this.#db.prepare('SELECT goal_id FROM goal_dependencies WHERE prerequisite_id = ?').all(current)) {
+        if (row.goal_id === prerequisite.id) fail(409, 'GOAL_DEPENDENCY_CYCLE', 'The prerequisite would create a cycle.');
+        if (!reachable.has(row.goal_id)) { reachable.add(row.goal_id); queue.push(row.goal_id); }
+      }
+    }
+    const createdAt = now();
+    this.#db.prepare('INSERT INTO goal_dependencies(goal_id, prerequisite_id, created_at) VALUES (?, ?, ?)')
+      .run(goal.id, prerequisite.id, createdAt);
+    return { goalId: goal.id, prerequisiteId: prerequisite.id, createdAt };
+  }
+
+  deleteGoalDependency(goalId, prerequisiteId) {
+    this.#requireUnlocked();
+    const result = this.#db.prepare('DELETE FROM goal_dependencies WHERE goal_id = ? AND prerequisite_id = ?')
+      .run(goalId, prerequisiteId);
+    if (!result.changes) fail(404, 'GOAL_DEPENDENCY_NOT_FOUND', 'Goal prerequisite not found.');
+    return { deleted: true };
   }
 
   patchRecord(id, input) {
@@ -227,6 +300,9 @@ export class Atlas {
       if (content.category === 'goal' && (parentId !== existing.parentId || position !== existing.position)) {
         this.#removePosition(existing.parentId, existing.position, id);
         this.#shiftPositions(parentId, position, 1, id);
+        if (parentId !== existing.parentId) {
+          this.#db.prepare('DELETE FROM goal_dependencies WHERE goal_id = ? OR prerequisite_id = ?').run(id, id);
+        }
       }
       this.#db.prepare(`UPDATE records SET revision = ?, parent_id = ?, position = ?, updated_at = ?, payload = ?
         WHERE id = ? AND revision = ?`)
@@ -311,6 +387,9 @@ export class Atlas {
       if (candidate.category === 'goal') {
         if (!existing.trashed) this.#removePosition(existing.parentId, existing.position, id);
         if (!candidate.trashed) this.#shiftPositions(candidate.parentId, candidate.position, 1, id);
+        if (candidate.parentId !== existing.parentId) {
+          this.#db.prepare('DELETE FROM goal_dependencies WHERE goal_id = ? OR prerequisite_id = ?').run(id, id);
+        }
       }
       this.#db.prepare(`UPDATE records SET revision = ?, trashed = ?, parent_id = ?, position = ?, updated_at = ?, payload = ?
         WHERE id = ? AND revision = ?`).run(newRevision, candidate.trashed ? 1 : 0,
@@ -616,7 +695,7 @@ export class Atlas {
   #replaceSnapshot(prepared, images) {
     this.#requireUnlocked();
     transaction(this.#db, () => {
-      this.#db.exec('DELETE FROM record_images; DELETE FROM links; DELETE FROM record_revisions; DELETE FROM records; DELETE FROM custom_fields;');
+      this.#db.exec('DELETE FROM record_images; DELETE FROM goal_dependencies; DELETE FROM links; DELETE FROM record_revisions; DELETE FROM records; DELETE FROM custom_fields;');
       for (const field of prepared.customFields) {
         this.#db.prepare(`INSERT INTO custom_fields(id, category, type, created_at, updated_at, payload, archived)
           VALUES (?, ?, ?, ?, ?, ?, ?)`).run(field.id, field.category, field.type, field.createdAt, field.updatedAt,
@@ -638,6 +717,10 @@ export class Atlas {
         this.#db.prepare(`INSERT INTO links(id, source_id, target_id, created_at, updated_at, payload)
           VALUES (?, ?, ?, ?, ?, ?)`).run(link.id, link.sourceId, link.targetId, link.createdAt, link.updatedAt,
           encryptJson(this.#key, { type: link.type, label: link.label, notes: link.notes }, objectAad('link', link.id, 1, 'link')));
+      }
+      for (const edge of prepared.goalDependencies) {
+        this.#db.prepare('INSERT INTO goal_dependencies(goal_id, prerequisite_id, created_at) VALUES (?, ?, ?)')
+          .run(edge.goalId, edge.prerequisiteId, edge.createdAt);
       }
       for (const image of images) {
         const content = readFileSync(image.path);
@@ -668,6 +751,8 @@ export class Atlas {
       revisions,
       customFields: this.listCustomFields(),
       links: this.#db.prepare('SELECT * FROM links ORDER BY created_at, id').all().map((row) => this.#linkFromRow(row)),
+      goalDependencies: this.#db.prepare('SELECT goal_id, prerequisite_id, created_at FROM goal_dependencies ORDER BY created_at, goal_id, prerequisite_id')
+        .all().map((edge) => ({ goalId: edge.goal_id, prerequisiteId: edge.prerequisite_id, createdAt: edge.created_at })),
     };
   }
 
@@ -860,7 +945,8 @@ export class Atlas {
   #validateSnapshot(snapshot) {
     if (!snapshot || snapshot.format !== 'eidolon-atlas-snapshot' || snapshot.version !== 1 ||
       !Array.isArray(snapshot.records) || !Array.isArray(snapshot.revisions) ||
-      !Array.isArray(snapshot.customFields) || !Array.isArray(snapshot.links)) {
+      !Array.isArray(snapshot.customFields) || !Array.isArray(snapshot.links) ||
+      (snapshot.goalDependencies !== undefined && !Array.isArray(snapshot.goalDependencies))) {
       fail(400, 'INVALID_BACKUP', 'The decrypted backup snapshot is invalid.');
     }
     const identifiers = (items, label, field = 'id') => {
@@ -878,7 +964,8 @@ export class Atlas {
     void fieldIds; void linkIds;
     let people = 0;
     const records = snapshot.records.map((record) => {
-      const content = normalizeRecord(record);
+      const migrated = record?.category === 'goal' ? { ...record, data: goalDataWithoutLegacyText(record.data) } : record;
+      const content = normalizeRecord(migrated);
       if (content.category === 'person') people += 1;
       requireRevision(record.revision);
       if (typeof record.trashed !== 'boolean' || typeof record.createdAt !== 'string' || typeof record.updatedAt !== 'string') {
@@ -935,7 +1022,10 @@ export class Atlas {
       if (byId.get(revision.recordId).category !== revision.category) fail(400, 'INVALID_BACKUP', 'A revision category does not match its record.');
       requireRevision(revision.revision);
       if (typeof revision.createdAt !== 'string' || !revision.snapshot) fail(400, 'INVALID_BACKUP', 'A revision is invalid.');
-      const normalized = normalizeRecord(revision.snapshot);
+      const migratedSnapshot = revision.category === 'goal'
+        ? { ...revision.snapshot, data: goalDataWithoutLegacyText(revision.snapshot.data) }
+        : revision.snapshot;
+      const normalized = normalizeRecord(migratedSnapshot);
       if (normalized.category !== revision.category) fail(400, 'INVALID_BACKUP', 'A revision category does not match.');
       if (typeof revision.snapshot.trashed !== 'boolean') fail(400, 'INVALID_BACKUP', 'A revision has invalid trash state.');
       const parentId = revision.snapshot.parentId ?? null;
@@ -989,6 +1079,38 @@ export class Atlas {
       if (linkEndpoints.has(key)) fail(400, 'INVALID_BACKUP', 'The backup contains duplicate links.');
       linkEndpoints.add(key);
     }
+    const goalDependencies = (snapshot.goalDependencies ?? []).map((edge) => {
+      if (!edge || typeof edge.goalId !== 'string' || typeof edge.prerequisiteId !== 'string' || typeof edge.createdAt !== 'string') {
+        fail(400, 'INVALID_BACKUP', 'A goal prerequisite is invalid.');
+      }
+      const goal = byId.get(edge.goalId);
+      const prerequisite = byId.get(edge.prerequisiteId);
+      if (!goal || !prerequisite || goal.category !== 'goal' || prerequisite.category !== 'goal' ||
+          !goal.parentId || goal.parentId !== prerequisite.parentId || goal.id === prerequisite.id) {
+        fail(400, 'INVALID_BACKUP', 'A goal prerequisite must connect sibling subgoals.');
+      }
+      return { goalId: goal.id, prerequisiteId: prerequisite.id, createdAt: edge.createdAt };
+    });
+    const dependencyKeys = new Set();
+    const dependencyNext = new Map();
+    for (const edge of goalDependencies) {
+      const key = `${edge.goalId}:${edge.prerequisiteId}`;
+      if (dependencyKeys.has(key)) fail(400, 'INVALID_BACKUP', 'The backup contains duplicate goal prerequisites.');
+      dependencyKeys.add(key);
+      if (!dependencyNext.has(edge.prerequisiteId)) dependencyNext.set(edge.prerequisiteId, []);
+      dependencyNext.get(edge.prerequisiteId).push(edge.goalId);
+    }
+    const visiting = new Set();
+    const visited = new Set();
+    const visitDependency = (goalId) => {
+      if (visiting.has(goalId)) fail(400, 'INVALID_BACKUP', 'The goal progression contains a cycle.');
+      if (visited.has(goalId)) return;
+      visiting.add(goalId);
+      for (const next of dependencyNext.get(goalId) ?? []) visitDependency(next);
+      visiting.delete(goalId);
+      visited.add(goalId);
+    };
+    for (const edge of goalDependencies) visitDependency(edge.prerequisiteId);
     const depths = new Map();
     for (const record of records) {
       const path = [];
@@ -1005,7 +1127,7 @@ export class Atlas {
       }
     }
     records.sort((left, right) => depths.get(left.id) - depths.get(right.id));
-    return { records, revisions, customFields, links };
+    return { records, revisions, customFields, links, goalDependencies };
   }
 
   #changeTrash(existing, trashed) {
@@ -1045,6 +1167,26 @@ export class Atlas {
     }
   }
 
+  #migrateGoalTextFields() {
+    transaction(this.#db, () => {
+      for (const row of this.#db.prepare("SELECT * FROM records WHERE category = 'goal'").all()) {
+        const value = decryptJson(this.#key, row.payload, objectAad('record', row.id, row.revision, row.category));
+        const data = goalDataWithoutLegacyText(value.data);
+        if (data === value.data) continue;
+        this.#db.prepare('UPDATE records SET payload = ? WHERE id = ?').run(
+          encryptJson(this.#key, { ...value, data }, objectAad('record', row.id, row.revision, row.category)), row.id);
+      }
+      for (const row of this.#db.prepare("SELECT * FROM record_revisions WHERE category = 'goal'").all()) {
+        const snapshot = decryptJson(this.#key, row.payload, objectAad('revision', row.record_id, row.revision, row.category));
+        const data = goalDataWithoutLegacyText(snapshot.data);
+        if (data === snapshot.data) continue;
+        this.#db.prepare('UPDATE record_revisions SET payload = ? WHERE record_id = ? AND revision = ?').run(
+          encryptJson(this.#key, { ...snapshot, data }, objectAad('revision', row.record_id, row.revision, row.category)),
+          row.record_id, row.revision);
+      }
+    });
+  }
+
   #encryptRecord(id, revision, category, snapshot) {
     const content = { title: snapshot.title, data: snapshot.data, customFieldValues: snapshot.customFieldValues };
     return encryptJson(this.#key, content, objectAad('record', id, revision, category));
@@ -1067,6 +1209,21 @@ export class Atlas {
     const row = this.#db.prepare('SELECT * FROM records WHERE id = ?').get(id);
     if (!row) fail(404, 'RECORD_NOT_FOUND', 'Record not found.');
     return row;
+  }
+
+  #goalRecord(id) {
+    const row = this.#recordRow(id);
+    if (row.category !== 'goal') fail(400, 'GOAL_REQUIRED', 'Goal progression is only available for goals.');
+    return this.#recordFromRow(row);
+  }
+
+  #goalProgress(id) {
+    const children = this.#db.prepare("SELECT id FROM records WHERE category = 'goal' AND parent_id = ? AND trashed = 0 ORDER BY position").all(id);
+    if (!children.length) {
+      const goal = this.#goalRecord(id);
+      return Number.isInteger(goal.data?.progress) ? goal.data.progress : 0;
+    }
+    return Math.round(children.reduce((total, child) => total + this.#goalProgress(child.id), 0) / children.length);
   }
 
   #experienceRow(id) {

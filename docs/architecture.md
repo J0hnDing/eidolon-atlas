@@ -21,7 +21,8 @@ details to full-page views; Person and Preference details remain drawer views.
 - `src/server.js` owns loopback HTTP, static files, bounded byte-buffered JSON
   parsing, and stable error responses. It contains no category policy.
 - The domain service owns validation, optimistic revisions, goal ordering,
-  links, search, trash, history, and atomic transfer.
+  acyclic sibling prerequisites, recursive progress roll-up, links, search,
+  trash, history, and atomic transfer.
 - The encryption collaborator owns key derivation and authenticated payload
   envelopes. Decrypted content never enters SQL queries or logs.
 - The database layer owns numbered migrations, constraints, transactions, WAL,

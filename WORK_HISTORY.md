@@ -49,3 +49,42 @@ Removed the built-in Goal status field and its status filters; added the planned
 ### Limitations
 
 No migration or backward compatibility was added for existing Goal status or Project currentState data, as requested. Automated visual browser inspection was not run; syntax checks and the full automated test suite passed.
+
+## 2026-08-09 00:16 — Refine subgoal parent details and graph sizing
+
+- Category: bugfix
+- Area: Goals
+
+### Summary
+
+Added immediate parent-goal context to subgoal Details and made it navigable. Hard-bounded progression and final-goal card dimensions, truncated long titles and prerequisite labels with ellipses, and stabilized card geometry used by DAG arrows.
+
+### Limitations
+
+none
+
+## 2026-08-08 22:51 — Add goal progression DAGs and progress roll-ups
+
+- Category: feature
+- Area: Goals
+
+### Summary
+
+Added per-goal progression graphs with sibling prerequisite DAG validation, recursive progress roll-ups, encrypted backup portability, dedicated pre-details UI, subgoal creation and inspection, progress editing, and removal to Recently Removed. Updated model documentation and focused tests.
+
+### Limitations
+
+Subgoal prerequisite relationships are selected when the subgoal is created; changing an existing prerequisite currently requires removing and recreating that subgoal.
+
+## 2026-08-09 00:34 — Simplify goal creation fields and add descriptions
+
+- Category: refactor
+- Area: Goals
+
+### Summary
+
+Simplified top-level Goal creation to title, horizon, target date, and description; removed parent and order controls from generic goal editing; retained dedicated Subgoal progress with a zero default; removed progress note and motivation from the goal contract; migrated their encrypted current and historical values into description; and kept parent progress derived from subgoals.
+
+### Limitations
+
+none

@@ -50,8 +50,7 @@ const FIELD_DEFS = {
     ["title", "Goal", "text", true, "A clear desired outcome"],
     ["horizon", "Horizon", "select", true, "", [["short", "Short term"], ["middle", "Middle term"], ["long", "Long term"]]],
     ["targetDate", "Target date", "partial", false, "YYYY, YYYY-MM, or YYYY-MM-DD"],
-    ["progressNote", "Progress note", "textarea", false, "A concise, current progress marker"],
-    ["motivation", "Motivation", "textarea", false, "Why this outcome matters"]
+    ["description", "Description", "textarea", false, "What this outcome means and any context worth keeping"]
   ],
   project: [
     ["title", "Project", "text", true, "What are you making?"],
@@ -264,7 +263,7 @@ function recordPayload(payload) { return normalizedRecord(payload?.record || pay
 function recordTitle(record) { return record?.title || "Untitled entry"; }
 function recordSummary(record) {
   const data = record?.data || {};
-  return data.summary || data.narrative || data.context || data.progressNote || data.motivation || data.notes || data.value || data.relationshipType || data.location || data.preferredName || "";
+  return data.summary || data.narrative || data.context || data.description || data.notes || data.value || data.relationshipType || data.location || data.preferredName || "";
 }
 
 function personData(recordOrData) {
@@ -926,13 +925,25 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
   root.append(element("div", { class: "detail-category" }, [icon(relationshipMeta?.icon || meta.icon), relationshipMeta ? `Relationship · ${relationshipMeta.label}` : meta.label]));
   const title = element("h2", { id: fullPage ? "detail-page-title" : "detail-title", text: recordTitle(record) });
   root.append(title, element("p", { class: "detail-lede", text: recordSummary(record) || "No description yet." }));
+  if (record.category === "goal") root.append(renderGoalProgression(record));
   const properties = element("dl", { class: "property-list" });
   const summaryKey = {
-    person: "summary", experience: "narrative", goal: record.data?.progressNote ? "progressNote" : "motivation",
+    person: "summary", experience: "narrative", goal: "description",
     project: "context", resource: "notes",
     relationship: record.data?.notes ? "notes" : "relationshipType", preference: "value"
   }[record.category];
-  const skipped = new Set([summaryKey, ...PERSON_SENSITIVE_KEYS]);
+  const skipped = new Set([summaryKey, ...(record.category === "goal" ? ["progress"] : []), ...PERSON_SENSITIVE_KEYS]);
+  if (record.category === "goal" && record.parentId) {
+    const parent = record.parentGoal || state.allRecords.find((item) => item.id === record.parentId);
+    const parentTitle = parent ? recordTitle(parent) : "Parent goal";
+    properties.append(
+      element("dt", { text: "Follows goal" }),
+      element("dd", {}, element("button", {
+        class: "detail-parent-link", type: "button", title: `Open ${parentTitle}`,
+        onclick: () => openDetail(record.parentId)
+      }, [element("span", { text: parentTitle }), icon("chevron")]))
+    );
+  }
   (FIELD_DEFS[record.category] || []).forEach(([key, label, type]) => {
     const value = record.data?.[key];
     if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length) || skipped.has(key)) return;
@@ -1025,6 +1036,202 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
     $("#detail-remove").replaceChildren(icon(removed ? "restore" : "trash"));
     $("#detail-remove").setAttribute("aria-label", removed ? "Restore entry" : "Move to recently removed");
   }
+}
+
+function renderGoalProgression(record) {
+  const body = element("div", { class: "goal-progression-loading" }, [
+    element("div", { class: "progress-skeleton" }),
+    element("p", { text: "Mapping your progression…" })
+  ]);
+  const section = element("section", { class: "goal-progression" }, [
+    element("header", { class: "goal-progression-head" }, [
+      element("div", {}, [element("span", { text: "Progression" }), element("h3", { text: "Path to this goal" })]),
+      !record.trashed ? element("button", { class: "button button-secondary goal-add-subgoal", type: "button", text: "Add subgoal", onclick: () => openSubgoalDialog(record) }) : null
+    ]),
+    body
+  ]);
+  loadGoalProgression(record, body);
+  return section;
+}
+
+async function loadGoalProgression(record, body) {
+  try {
+    const graph = await api(`/goals/${encodeURIComponent(record.id)}/progression`);
+    if (!body.isConnected) return;
+    body.className = "goal-progression-body";
+    body.replaceChildren();
+    const summary = element("div", { class: "goal-progress-summary" }, [
+      element("div", { class: "progress-ring", style: { "--progress": `${graph.goal.progress * 3.6}deg` } }, [
+        element("strong", { text: `${graph.goal.progress}%` }), element("span", { text: "overall" })
+      ]),
+      element("div", {}, [
+        element("strong", { text: graph.nodes.length ? `${graph.nodes.length} active ${graph.nodes.length === 1 ? "subgoal" : "subgoals"}` : "No subgoals yet" }),
+        element("p", { text: graph.nodes.length ? "Overall progress rolls up evenly from the active subgoals in this path." : "Add concrete steps, then connect prerequisites to show what comes next." })
+      ])
+    ]);
+    body.append(summary);
+    if (!graph.nodes.length) {
+      body.append(element("div", { class: "goal-progression-empty" }, [
+        element("span", {}, icon("compass")),
+        element("div", {}, [element("strong", { text: "Turn the outcome into a path" }), element("p", { text: "Create the first subgoal. Later steps can follow one or several earlier steps without forming cycles." })])
+      ]));
+      return;
+    }
+    const nodeById = new Map(graph.nodes.map((node) => [node.id, node]));
+    const incoming = new Map(graph.nodes.map((node) => [node.id, []]));
+    const outgoing = new Map(graph.nodes.map((node) => [node.id, []]));
+    graph.dependencies.forEach((edge) => {
+      if (!nodeById.has(edge.goalId) || !nodeById.has(edge.prerequisiteId)) return;
+      incoming.get(edge.goalId).push(edge.prerequisiteId);
+      outgoing.get(edge.prerequisiteId).push(edge.goalId);
+    });
+    const indegree = new Map([...incoming].map(([id, edges]) => [id, edges.length]));
+    const level = new Map(graph.nodes.map((node) => [node.id, 0]));
+    const queue = graph.nodes.filter((node) => indegree.get(node.id) === 0).map((node) => node.id);
+    while (queue.length) {
+      const id = queue.shift();
+      outgoing.get(id).forEach((next) => {
+        level.set(next, Math.max(level.get(next), level.get(id) + 1));
+        indegree.set(next, indegree.get(next) - 1);
+        if (indegree.get(next) === 0) queue.push(next);
+      });
+    }
+    const maximum = Math.max(...level.values());
+    const canvas = element("div", { class: "goal-graph-canvas" });
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "goal-graph-edges");
+    svg.setAttribute("aria-hidden", "true");
+    canvas.append(svg);
+    for (let index = 0; index <= maximum; index += 1) {
+      const column = element("div", { class: "goal-graph-column" });
+      graph.nodes.filter((node) => level.get(node.id) === index).forEach((node) => column.append(goalGraphNode(node, incoming.get(node.id), nodeById, record)));
+      canvas.append(column);
+    }
+    const finalColumn = element("div", { class: "goal-graph-column goal-final-column" });
+    finalColumn.append(element("article", { class: "goal-final-node", dataset: { goalFinal: "true" } }, [
+      element("span", { text: "Final goal" }), element("strong", { text: recordTitle(record) }),
+      element("div", { class: "goal-node-meter" }, element("i", { style: { width: `${graph.goal.progress}%` } })),
+      element("small", { text: `${graph.goal.progress}% complete` })
+    ]));
+    canvas.append(finalColumn);
+    body.append(element("div", { class: "goal-graph-scroll" }, canvas));
+    const draw = () => drawGoalGraphEdges(canvas, svg, graph.dependencies, graph.nodes.filter((node) => outgoing.get(node.id).length === 0));
+    requestAnimationFrame(draw);
+    if (window.ResizeObserver) new ResizeObserver(draw).observe(canvas);
+  } catch (error) {
+    if (body.isConnected) body.replaceChildren(element("p", { class: "detail-empty", text: `Progression unavailable: ${error.message}` }));
+  }
+}
+
+function goalGraphNode(node, prerequisites, nodeById, finalGoal) {
+  const label = element("output", { text: `${node.progress}%` });
+  const range = element("input", { type: "range", min: 0, max: 100, step: 1, value: node.progress,
+    "aria-label": `Progress for ${recordTitle(node)}`,
+    disabled: node.hasSubgoals,
+    title: node.hasSubgoals ? "Progress rolls up from this subgoal’s own path" : "Update progress",
+    oninput: (event) => { label.textContent = `${event.currentTarget.value}%`; },
+    onchange: (event) => updateSubgoalProgress(node, Number(event.currentTarget.value), finalGoal) });
+  return element("article", { class: "goal-graph-node", dataset: { goalNode: node.id } }, [
+    element("header", {}, [
+      element("button", { class: "goal-node-title", type: "button", onclick: () => openDetail(node.id), title: `Inspect ${recordTitle(node)}` }, [
+        element("strong", { text: recordTitle(node) }), node.hasSubgoals ? element("small", { text: "Has its own path" }) : null
+      ]),
+      !finalGoal.trashed ? element("button", { class: "compact-delete", type: "button", title: `Remove ${recordTitle(node)}`, "aria-label": `Remove ${recordTitle(node)}`, onclick: () => removeSubgoal(node, finalGoal) }, icon("trash")) : null
+    ]),
+    prerequisites.length ? element("p", { class: "goal-node-prerequisites", text: `After ${prerequisites.map((id) => recordTitle(nodeById.get(id))).join(" + ")}` }) : element("p", { class: "goal-node-prerequisites", text: "Can start now" }),
+    element("div", { class: "goal-node-progress" }, [range, label])
+  ]);
+}
+
+function drawGoalGraphEdges(canvas, svg, dependencies, terminalNodes) {
+  const bounds = canvas.getBoundingClientRect();
+  const width = canvas.scrollWidth;
+  const height = canvas.scrollHeight;
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("width", width);
+  svg.setAttribute("height", height);
+  svg.replaceChildren();
+  const marker = document.createElementNS(svg.namespaceURI, "marker");
+  marker.setAttribute("id", `goal-arrow-${Math.random().toString(36).slice(2)}`);
+  marker.setAttribute("markerWidth", "7"); marker.setAttribute("markerHeight", "7"); marker.setAttribute("refX", "6"); marker.setAttribute("refY", "3.5"); marker.setAttribute("orient", "auto");
+  const arrow = document.createElementNS(svg.namespaceURI, "path"); arrow.setAttribute("d", "M0,0 L7,3.5 L0,7 Z"); marker.append(arrow);
+  const defs = document.createElementNS(svg.namespaceURI, "defs"); defs.append(marker); svg.append(defs);
+  const markerUrl = `url(#${marker.id})`;
+  const connect = (source, target) => {
+    if (!source || !target) return;
+    const from = source.getBoundingClientRect(); const to = target.getBoundingClientRect();
+    const x1 = from.right - bounds.left; const y1 = from.top + from.height / 2 - bounds.top;
+    const x2 = to.left - bounds.left; const y2 = to.top + to.height / 2 - bounds.top;
+    const bend = Math.max(24, (x2 - x1) * .48);
+    const path = document.createElementNS(svg.namespaceURI, "path");
+    path.setAttribute("d", `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`);
+    path.setAttribute("marker-end", markerUrl); svg.append(path);
+  };
+  dependencies.forEach((edge) => connect(canvas.querySelector(`[data-goal-node="${CSS.escape(edge.prerequisiteId)}"]`), canvas.querySelector(`[data-goal-node="${CSS.escape(edge.goalId)}"]`)));
+  const finalNode = canvas.querySelector("[data-goal-final]");
+  terminalNodes.forEach((node) => connect(canvas.querySelector(`[data-goal-node="${CSS.escape(node.id)}"]`), finalNode));
+}
+
+async function updateSubgoalProgress(node, progress, finalGoal) {
+  try {
+    await api(`/records/${encodeURIComponent(node.id)}`, { method: "PATCH", body: { revision: node.revision, data: { ...node.data, progress } } });
+    notify("Subgoal progress updated.", "success");
+    await openFullPageDetail(finalGoal.id);
+  } catch (error) { notify(error.message, "error"); }
+}
+
+function openSubgoalDialog(goal) {
+  document.querySelector("#subgoal-dialog")?.remove();
+  const dialog = element("dialog", { id: "subgoal-dialog", class: "modal modal-small" });
+  const form = element("form", { method: "dialog" });
+  form.append(
+    element("header", { class: "modal-header" }, [element("div", {}, [element("p", { class: "eyebrow", text: "Build the path" }), element("h2", { text: "Add subgoal" })]), element("button", { class: "icon-button", type: "button", "aria-label": "Close", onclick: () => dialog.close() }, icon("close"))]),
+    element("div", { class: "modal-body form-grid" }, [
+      element("label", { class: "field full" }, [element("span", { text: "Subgoal" }), element("input", { name: "title", maxlength: 160, required: true, placeholder: "A concrete outcome" })]),
+      element("label", { class: "field" }, [element("span", { text: "Target date" }), element("input", { name: "targetDate", placeholder: "YYYY-MM-DD" })]),
+      element("label", { class: "field" }, [element("span", { text: "Progress" }), element("input", { name: "progress", type: "number", min: 0, max: 100, step: 1, value: 0, required: true })]),
+      element("label", { class: "field full" }, [element("span", { text: "Description" }), element("textarea", { name: "description", placeholder: "What this step means and any context worth keeping" })]),
+      element("fieldset", { class: "subgoal-prerequisite-field full" }, [element("legend", { text: "Follows (optional)" }), element("div", { class: "subgoal-prerequisite-options", text: "Loading existing subgoals…" })])
+    ]),
+    element("footer", { class: "modal-footer" }, [element("button", { class: "button button-quiet", type: "button", onclick: () => dialog.close(), text: "Cancel" }), element("button", { class: "button button-primary", type: "submit", text: "Add subgoal" })])
+  );
+  form.addEventListener("submit", (event) => saveSubgoal(event, goal, dialog));
+  dialog.append(form); document.body.append(dialog); dialog.addEventListener("close", () => dialog.remove()); dialog.showModal();
+  api(`/goals/${encodeURIComponent(goal.id)}/progression`).then((graph) => {
+    const options = dialog.querySelector(".subgoal-prerequisite-options");
+    options.replaceChildren();
+    if (!graph.nodes.length) return options.append(element("p", { class: "detail-empty", text: "This will be the first step." }));
+    graph.nodes.forEach((node) => options.append(element("label", { class: "check-row" }, [element("input", { type: "checkbox", name: "prerequisite", value: node.id }), element("span", { text: `${recordTitle(node)} · ${node.progress}%` })])));
+  }).catch((error) => notify(error.message, "error"));
+  setTimeout(() => form.elements.title.focus(), 30);
+}
+
+async function saveSubgoal(event, goal, dialog) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  const button = form.querySelector("button[type='submit']");
+  setButtonBusy(button, true, "Adding…");
+  try {
+    const createdPayload = await api("/records", { method: "POST", body: {
+      category: "goal", title: form.elements.title.value.trim(), parentId: goal.id,
+      data: { horizon: goal.data?.horizon || "short", targetDate: form.elements.targetDate.value.trim(), description: form.elements.description.value.trim(), progress: Number(form.elements.progress.value) },
+      customFieldValues: {}
+    } });
+    const created = recordPayload(createdPayload);
+    for (const input of form.querySelectorAll("[name='prerequisite']:checked")) {
+      await api(`/goals/${encodeURIComponent(created.id)}/prerequisites`, { method: "POST", body: { prerequisiteId: input.value } });
+    }
+    dialog.close(); notify("Subgoal added to the progression.", "success"); await openFullPageDetail(goal.id);
+  } catch (error) { notify(error.message, "error"); setButtonBusy(button, false); }
+}
+
+async function removeSubgoal(node, finalGoal) {
+  if (!window.confirm(`Remove “${recordTitle(node)}” from this progression? It will move to Recently Removed.`)) return;
+  try {
+    await api(`/records/${encodeURIComponent(node.id)}`, { method: "DELETE", body: { revision: node.revision } });
+    notify("Subgoal moved to Recently Removed.", "success"); await Promise.all([openFullPageDetail(finalGoal.id), refreshCounts()]);
+  } catch (error) { notify(error.message, "error"); }
 }
 
 async function openFullPageDetail(id) {
@@ -1144,11 +1351,6 @@ async function openRecordDialog(record = null) {
     PERSON_SENSITIVE_DEFS.forEach((definition) => sensitiveBody.append(inputForDefinition(definition, record?.data?.[definition[0]] ?? "")));
     fields.append(element("details", { class: "sensitive-editor" }, [element("summary", { text: "Sensitive information" }), sensitiveBody]));
   }
-  if (category === "goal") {
-    const parent = element("select", { name: "parentId" }, element("option", { value: "", text: "No parent goal" }));
-    state.records.filter((item) => item.category === "goal" && item.id !== record?.id).forEach((item) => parent.append(element("option", { value: item.id, text: recordTitle(item), selected: item.id === record?.parentId })));
-    fields.append(element("label", { class: "field" }, [element("span", { text: "Parent goal" }), parent]), element("label", { class: "field" }, [element("span", { text: "Order" }), element("input", { name: "position", type: "number", min: 0, step: 1, value: record?.position ?? state.records.length })]));
-  }
   state.customFields.filter((field) => !field.archived).forEach((field) => fields.append(customFieldInput(field, record?.customFieldValues?.[field.id])));
   $("#record-form").dataset.category = category;
   $("#record-dialog").showModal();
@@ -1194,6 +1396,7 @@ async function saveRecord(event) {
       if (control?.value.trim()) data[key] = control.value.trim();
     });
   }
+  if (category === "goal") data.progress = Number.isInteger(state.editing?.data?.progress) ? state.editing.data.progress : 0;
   $$('[data-custom-field]', form).forEach((wrapper) => {
     const control = $("input,textarea,select", wrapper);
     const type = wrapper.dataset.customType;
@@ -1201,10 +1404,6 @@ async function saveRecord(event) {
     customFieldValues[wrapper.dataset.customField] = type === "boolean" ? control.checked : type === "number" ? Number(control.value) : control.value.trim();
   });
   const body = { title: form.elements.title.value.trim(), data, customFieldValues };
-  if (category === "goal") {
-    body.parentId = form.elements.parentId.value || null;
-    body.position = Number(form.elements.position.value) || 0;
-  }
   const button = $("#save-record");
   setButtonBusy(button, true, "Saving…");
   try {
@@ -1441,7 +1640,7 @@ async function importBackup() {
 function openPromptDialog() {
   const prompts = [
     { category: "person", icon: "person", title: "A profile to complete", recordTitle: "My legal name", description: "Create a blank personal portrait.", data: { preferredName: "", gender: "", birthDate: "", birthPlace: "", nationalities: [], languages: [], maritalStatus: "", emails: [], phoneNumbers: [], address: "", summary: "", notes: "" } },
-    { category: "goal", icon: "compass", title: "A direction to name", recordTitle: "An intention to define", description: "Hold a place for one intention.", data: { horizon: "short", targetDate: "", progressNote: "", motivation: "" } },
+    { category: "goal", icon: "compass", title: "A direction to name", recordTitle: "An intention to define", description: "Hold a place for one intention.", data: { horizon: "short", targetDate: "", description: "", progress: 0 } },
     { category: "resource", icon: "bookmark", title: "Something useful", recordTitle: "A useful resource", description: "Save a place for a resource you rely on.", data: { kind: "other", ownership: "", access: "", availability: "available", quantity: "", unit: "", notes: "" } }
   ];
   const root = $("#prompt-options");

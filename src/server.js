@@ -179,10 +179,20 @@ async function routeApi(atlas, request, response, url, limits) {
   if (method === 'POST' && path === '/api/records') {
     return sendJson(response, 201, atlas.createRecord(await readJson(request, limits.body)));
   }
+  let match = /^\/api\/goals\/([^/]+)\/progression$/.exec(path);
+  if (match && method === 'GET') return sendJson(response, 200, atlas.getGoalGraph(decodeSegment(match[1])));
+  match = /^\/api\/goals\/([^/]+)\/prerequisites$/.exec(path);
+  if (match && method === 'POST') {
+    const body = requireObject(await readJson(request, limits.body));
+    return sendJson(response, 201, atlas.createGoalDependency(decodeSegment(match[1]), body.prerequisiteId));
+  }
+  match = /^\/api\/goals\/([^/]+)\/prerequisites\/([^/]+)$/.exec(path);
+  if (match && method === 'DELETE') return sendJson(response, 200,
+    atlas.deleteGoalDependency(decodeSegment(match[1]), decodeSegment(match[2])));
   if (method === 'DELETE' && path === '/api/trash') {
     return sendJson(response, 200, atlas.emptyTrash());
   }
-  let match = /^\/api\/records\/([^/]+)\/images$/.exec(path);
+  match = /^\/api\/records\/([^/]+)\/images$/.exec(path);
   if (match) {
     const recordId = decodeSegment(match[1]);
     if (method === 'GET') return sendJson(response, 200, atlas.listImages(recordId));

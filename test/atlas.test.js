@@ -35,6 +35,8 @@ test('category contracts and person singleton are enforced', async (t) => {
   assert.throws(() => create(atlas, 'experience', 'Bad ongoing', { kind: 'period', startDate: '2026', endDate: '2026-02', ongoing: true }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'goal', 'Bad goal', { horizon: 'someday' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'goal', 'Goal with status', { horizon: 'short', status: 'active' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'goal', 'Legacy goal text', { horizon: 'short', progressNote: 'old' }), { code: 'VALIDATION_ERROR' });
+  assert.equal(create(atlas, 'goal', 'Described goal', { horizon: 'short', description: 'Clear context', progress: 0 }).data.description, 'Clear context');
   assert.throws(() => create(atlas, 'project', 'Old state field', { context: '', status: 'active', githubLink: '', currentState: '' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'project', 'Bad status', { context: '', status: 'in_progress', githubLink: '' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'project', 'Bad link', { context: '', status: 'active', githubLink: 'github.com/example/repo' }), { code: 'VALIDATION_ERROR' });
@@ -62,7 +64,7 @@ test('numbered migrations are idempotent across reopen', async (t) => {
   const first = new Atlas({ databasePath });
   await first.setup(APP_PASSPHRASE);
   assert.deepEqual(first.database.prepare('SELECT version FROM schema_migrations ORDER BY version').all()
-    .map((row) => row.version), [1, 2, 3, 4]);
+    .map((row) => row.version), [1, 2, 3, 4, 5]);
   first.close();
   const reopened = new Atlas({ databasePath });
   assert.deepEqual(reopened.status(), { initialized: true, locked: true });
@@ -97,6 +99,36 @@ test('unlock migrates the removed person relationship kind to family once', asyn
   atlas.lock();
   await atlas.unlock(APP_PASSPHRASE);
   assert.equal(atlas.getRecord(relationship.id).revision, 2);
+});
+
+test('unlock purges legacy goal text fields into description across current data and history', async (t) => {
+  const { atlas } = await fixture(t);
+  const goal = create(atlas, 'goal', 'Legacy text', { horizon: 'short', description: '', progress: 0 });
+  const config = JSON.parse(atlas.database.prepare("SELECT value FROM metadata WHERE key = 'encryption-config'").get().value);
+  const salt = Buffer.from(config.salt, 'base64');
+  delete config.salt;
+  const key = await deriveKey(APP_PASSPHRASE, salt, config);
+  const legacyData = { horizon: 'short', progress: 0, motivation: 'Why it matters', progressNote: 'Halfway there' };
+  atlas.database.prepare('UPDATE records SET payload = ? WHERE id = ?').run(
+    encryptJson(key, { title: goal.title, data: legacyData, customFieldValues: {} },
+      objectAad('record', goal.id, 1, 'goal')),
+    goal.id,
+  );
+  atlas.database.prepare('UPDATE record_revisions SET payload = ? WHERE record_id = ? AND revision = 1').run(
+    encryptJson(key, { category: 'goal', title: goal.title, data: legacyData, customFieldValues: {},
+      parentId: null, position: 0, trashed: false }, objectAad('revision', goal.id, 1, 'goal')),
+    goal.id,
+  );
+  key.fill(0);
+
+  atlas.lock();
+  await atlas.unlock(APP_PASSPHRASE);
+  assert.deepEqual(atlas.getRecord(goal.id).data, {
+    horizon: 'short', progress: 0, description: 'Why it matters\n\nHalfway there',
+  });
+  assert.deepEqual(atlas.listRevisions(goal.id)[0].data, {
+    horizon: 'short', progress: 0, description: 'Why it matters\n\nHalfway there',
+  });
 });
 
 test('user content is encrypted and tampering and wrong passphrases fail closed', async (t) => {
@@ -141,6 +173,45 @@ test('goal sibling order, moves, cycle rejection, and conservative trash remain 
   assert.equal(trashedChild.trashed, true);
   const trashedParent = atlas.trashRecord(first.id, moved.revision);
   assert.equal(trashedParent.trashed, true);
+});
+
+test('goal progression is a sibling DAG with recursive progress roll-up and portable edges', async (t) => {
+  const { atlas, directory } = await fixture(t);
+  const root = create(atlas, 'goal', 'Final outcome', { horizon: 'long', progress: 3 });
+  const first = create(atlas, 'goal', 'Foundation', { horizon: 'short', progress: 20 }, { parentId: root.id });
+  const second = create(atlas, 'goal', 'Build', { horizon: 'middle', progress: 60 }, { parentId: root.id });
+  const third = create(atlas, 'goal', 'Launch', { horizon: 'middle', progress: 100 }, { parentId: root.id });
+  const nested = create(atlas, 'goal', 'Foundation checkpoint', { horizon: 'short', progress: 80 }, { parentId: first.id });
+  assert.equal(atlas.getRecord(nested.id).parentGoal.title, 'Foundation');
+  assert.equal(atlas.getRecord(root.id).parentGoal, undefined);
+  atlas.createGoalDependency(second.id, first.id);
+  atlas.createGoalDependency(third.id, second.id);
+
+  const graph = atlas.getGoalGraph(root.id);
+  assert.equal(graph.goal.progress, 80);
+  assert.deepEqual(graph.nodes.map((goal) => [goal.title, goal.progress]), [
+    ['Foundation', 80], ['Build', 60], ['Launch', 100],
+  ]);
+  assert.deepEqual(graph.dependencies.map((edge) => [edge.goalId, edge.prerequisiteId]), [
+    [second.id, first.id], [third.id, second.id],
+  ]);
+  assert.throws(() => atlas.createGoalDependency(first.id, third.id), { code: 'GOAL_DEPENDENCY_CYCLE' });
+  assert.throws(() => atlas.createGoalDependency(nested.id, second.id), { code: 'INVALID_GOAL_DEPENDENCY' });
+
+  const portable = await atlas.export(BACKUP_PASSPHRASE);
+  const destinationPath = join(directory, 'destination.sqlite');
+  const destination = new Atlas({ databasePath: destinationPath });
+  await destination.setup(APP_PASSPHRASE);
+  await destination.import(BACKUP_PASSPHRASE, portable);
+  assert.deepEqual(destination.getGoalGraph(root.id).nodes.map((goal) => goal.title), ['Foundation', 'Build', 'Launch']);
+  assert.deepEqual(destination.getGoalGraph(root.id).dependencies.map((edge) => [edge.goalId, edge.prerequisiteId]), [
+    [second.id, first.id], [third.id, second.id],
+  ]);
+  destination.close();
+
+  const moved = atlas.patchRecord(second.id, { revision: second.revision, parentId: first.id });
+  assert.equal(moved.parentId, first.id);
+  assert.equal(atlas.getGoalGraph(root.id).dependencies.length, 0);
 });
 
 test('optimistic edits, no-ops, revisions, and historical restore work', async (t) => {

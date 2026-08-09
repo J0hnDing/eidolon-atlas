@@ -127,6 +127,15 @@ function validateCategoryData(category, data) {
     if (Object.hasOwn(data, 'status')) {
       fail(400, 'VALIDATION_ERROR', 'Goal data.status is not supported.');
     }
+    if (Object.hasOwn(data, 'progressNote') || Object.hasOwn(data, 'motivation')) {
+      fail(400, 'VALIDATION_ERROR', 'Goal progressNote and motivation are not supported; use description.');
+    }
+    if (data.description !== undefined && typeof data.description !== 'string') {
+      fail(400, 'VALIDATION_ERROR', 'Goal description must be a string.');
+    }
+    if (data.progress !== undefined && (!Number.isInteger(data.progress) || data.progress < 0 || data.progress > 100)) {
+      fail(400, 'VALIDATION_ERROR', 'Goal progress must be a whole number from 0 to 100.');
+    }
   }
   if (category === 'project') {
     const unexpected = Object.keys(data).filter((key) => !['context', 'status', 'githubLink'].includes(key));

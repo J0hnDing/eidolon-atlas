@@ -26,10 +26,18 @@ may also carry encrypted JPEG, PNG, or WebP images, up to 20 MiB per image and
 
 ### Goal
 
-A Goal has a short-, middle-, or long-term horizon.
-Goals form an ordered parent/subgoal tree. A goal has at most one parent;
-cycles are invalid; sibling order is explicit. This hierarchy is separate from
-ordinary cross-record links.
+A Goal has a short-, middle-, or long-term horizon, an optional target date,
+and a description. Top-level goal creation does not ask for progress; subgoals
+start at a user-selected progress value that defaults to zero. Parent progress
+rolls up from subgoals, and subgoal ownership and order are assigned by the
+progression that creates them.
+Goals form an ordered parent/subgoal hierarchy. Within each goal, its direct
+subgoals can declare other sibling subgoals as prerequisites, producing a
+directed acyclic progression graph whose terminal steps lead to the parent
+goal. A goal has at most one parent; hierarchy and prerequisite cycles are
+invalid; sibling order is explicit. Each leaf goal stores progress from 0 to
+100, while parent progress rolls up evenly from its active direct subgoals.
+This progression is separate from ordinary cross-record links.
 
 ### Project
 

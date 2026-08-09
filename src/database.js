@@ -82,6 +82,21 @@ const MIGRATIONS = [
       CREATE INDEX record_images_record ON record_images(record_id, position);
     `,
   },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE goal_dependencies (
+        goal_id TEXT NOT NULL,
+        prerequisite_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (goal_id, prerequisite_id),
+        CHECK (goal_id <> prerequisite_id),
+        FOREIGN KEY (goal_id) REFERENCES records(id) ON DELETE CASCADE,
+        FOREIGN KEY (prerequisite_id) REFERENCES records(id) ON DELETE CASCADE
+      ) STRICT;
+      CREATE INDEX goal_dependencies_prerequisite ON goal_dependencies(prerequisite_id);
+    `,
+  },
 ];
 
 export function openDatabase(path = 'data/atlas.sqlite') {
