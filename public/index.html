@@ -50,8 +50,8 @@
       </div>
       <nav id="category-nav" class="category-nav"></nav>
       <div class="sidebar-foot">
-        <button id="trash-button" class="nav-row" type="button"><span data-icon="trash"></span><span>Recently removed</span><span id="trash-count" class="count-pill">0</span></button>
         <button id="backup-button" class="nav-row" type="button"><span data-icon="archive"></span><span>Backup &amp; restore</span></button>
+        <button id="settings-button" class="nav-row" type="button"><span data-icon="sliders"></span><span>Settings</span></button>
         <button id="lock-button" class="nav-row" type="button"><span data-icon="lock"></span><span>Lock atlas</span></button>
       </div>
     </aside>
@@ -156,6 +156,29 @@
         <label id="field-options-row" class="field full" hidden><span>Choices</span><textarea name="options" placeholder="One choice per line"></textarea><small>Choices must be unique.</small></label>
       </div>
       <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Add field</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="knowledge-node-dialog" class="modal">
+    <form id="knowledge-node-form" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">Knowledge structure</p><h2 id="knowledge-node-dialog-title">Add concept</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <div class="modal-body form-grid">
+        <input name="id" type="hidden">
+        <label class="field full"><span>Name</span><input name="name" maxlength="120" required placeholder="e.g. Classical mechanics"></label>
+        <label class="field"><span>Branch</span><select name="branch" required><option value="subjects">Subjects</option><option value="ideologies">Ideologies</option></select></label>
+        <label class="field"><span>Parent</span><select name="parentId"></select></label>
+        <label class="field"><span>Knowledge status</span><select name="status" required><option value="unassessed">Unassessed</option><option value="unknown">Unknown</option><option value="known">Known</option></select></label>
+        <label id="knowledge-understanding-field" class="field full" hidden><span>Explanation</span><textarea name="understanding" maxlength="2000" placeholder="State the central idea directly, in your own words."></textarea><small>Known concepts require one direct explanation.</small></label>
+      </div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button id="save-knowledge-node" class="button button-primary" type="submit"><span data-icon="check"></span>Save concept</button></footer>
+    </form>
+  </dialog>
+
+  <dialog id="knowledge-connection-dialog" class="modal modal-small">
+    <form id="knowledge-connection-form" method="dialog">
+      <header class="modal-header"><div><p class="eyebrow">Knowledge connection</p><h2>Add connection</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <div class="modal-body stack"><label class="field"><span>Related concept</span><select name="targetId" required></select></label><p class="muted">Connections are undirected and do not change where a concept belongs in the tree.</p></div>
+      <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Add connection</button></footer>
     </form>
   </dialog>
 

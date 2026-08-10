@@ -49,6 +49,7 @@ const FIELD_DEFS = {
   goal: [
     ["title", "Goal", "text", true, "A clear desired outcome"],
     ["horizon", "Horizon", "select", true, "", [["short", "Short term"], ["middle", "Middle term"], ["long", "Long term"]]],
+    ["importance", "Importance", "select", true, "", [["low", "Low"], ["medium", "Medium"], ["high", "High"]]],
     ["targetDate", "Target date", "partial", false, "YYYY, YYYY-MM, or YYYY-MM-DD"],
     ["description", "Description", "textarea", false, "What this outcome means and any context worth keeping"]
   ],
@@ -110,6 +111,7 @@ const ICONS = {
   grid: ["M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"],
   history: ["M3 12a9 9 0 1 0 3-6.7L3 8", "M3 3v5h5", "M12 7v5l3 2"],
   key: ["M21 2l-2 2m-7.6 7.6a5 5 0 1 1-7.1 7.1 5 5 0 0 1 7.1-7.1Zm0 0L15 8l3 3 3-3-3-3"],
+  knowledge: ["M4 5.5A2.5 2.5 0 0 1 6.5 3H11v17H6.5A2.5 2.5 0 0 0 4 22z", "M20 5.5A2.5 2.5 0 0 0 17.5 3H13v17h4.5A2.5 2.5 0 0 1 20 22z"],
   layers: ["m12 2 9 5-9 5-9-5z", "m3 12 9 5 9-5", "m3 17 9 5 9-5"],
   link: ["M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.1 1", "M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.1-1"],
   list: ["M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"],
@@ -158,12 +160,17 @@ const state = {
   view: "cards",
   query: "",
   trash: false,
+  trashCount: 0,
   loading: false,
   loadToken: 0,
   route: null,
   detailMode: null,
   gallery: { recordId: null, images: [], loading: false },
-  lightboxIndex: -1
+  lightboxIndex: -1,
+  knowledge: {
+    branches: [], nodes: [], selected: null,
+    collapsedBranches: new Set(), collapsedNodes: new Set(), disclosureInitialized: false
+  }
 };
 
 const $ = (selector, root = document) => root.querySelector(selector);
@@ -384,18 +391,25 @@ function buildNavigation() {
     ]);
     nav.append(button);
   });
+  nav.append(element("button", { class: "nav-row", type: "button", dataset: { workspace: "knowledge" }, onclick: () => navigateTo({ kind: "knowledge" }) }, [
+    icon("knowledge"), element("span", { text: "Knowledge" }), element("span", { class: "count-pill", text: "0", dataset: { count: "knowledge" } })
+  ]));
   const categorySelect = $("#field-form select[name='category']");
   Object.entries(CATEGORIES).forEach(([value, meta]) => categorySelect.append(element("option", { value, text: meta.label })));
 }
 
 async function refreshCounts() {
   try {
-    const [activePayload, trashPayload] = await Promise.all([api("/records?trashed=false"), api("/records?trashed=true")]);
+    const [activePayload, trashPayload, knowledgePayload] = await Promise.all([api("/records?trashed=false"), api("/records?trashed=true"), api("/knowledge/nodes")]);
     state.allRecords = listPayload(activePayload, "records").map(normalizedRecord);
     const counts = Object.fromEntries(Object.keys(CATEGORIES).map((key) => [key, 0]));
     state.allRecords.forEach((record) => { if (record.category in counts) counts[record.category] += 1; });
     Object.entries(counts).forEach(([key, count]) => { const node = $(`[data-count="${key}"]`); if (node) node.textContent = String(count); });
-    $("#trash-count").textContent = String(listPayload(trashPayload, "records").length);
+    state.trashCount = listPayload(trashPayload, "records").length;
+    const trashCount = $("#trash-count");
+    if (trashCount) trashCount.textContent = String(state.trashCount);
+    const knowledgeCount = $("[data-count='knowledge']");
+    if (knowledgeCount) knowledgeCount.textContent = String(listPayload(knowledgePayload, "nodes").length);
   } catch (error) {
     if (error.status === 401 || error.status === 423) return lockLocally();
   }
@@ -408,6 +422,12 @@ async function chooseCategory(category) {
 function routeFromLocation() {
   const path = window.location.pathname.replace(/^\/+|\/+$/g, "");
   const parts = path ? path.split("/").map((part) => decodeURIComponent(part)) : [];
+  if (parts[0] === "knowledge") {
+    if (parts[1] === "nodes" && parts[2]) return { kind: "knowledge-node", id: Number(parts[2]) };
+    if (["subjects", "ideologies"].includes(parts[1])) return { kind: "knowledge-branch", branch: parts[1] };
+    return { kind: "knowledge" };
+  }
+  if (parts[0] === "settings") return { kind: "settings" };
   if (parts[0] === "search") return { kind: "search", query: new URLSearchParams(window.location.search).get("q")?.trim() || "" };
   if (parts[0] === "trash" || parts[0] === "recently-removed") return { kind: "trash", category: state.category || "person" };
   if (parts[0] === "list" && parts[1]) {
@@ -424,6 +444,10 @@ function routeFromLocation() {
 }
 
 function routePath(route) {
+  if (route.kind === "knowledge") return "/knowledge";
+  if (route.kind === "knowledge-branch") return `/knowledge/${route.branch}`;
+  if (route.kind === "knowledge-node") return `/knowledge/nodes/${encodeURIComponent(route.id)}`;
+  if (route.kind === "settings") return "/settings";
   if (route.kind === "search") return `/search${route.query ? `?q=${encodeURIComponent(route.query)}` : ""}`;
   if (route.kind === "trash") return "/trash";
   const base = `/${ROUTE_PLURALS[route.category] || route.category}`;
@@ -438,7 +462,7 @@ async function navigateTo(route, { replace = false } = {}) {
   const path = routePath(route);
   if (window.location.pathname + window.location.search !== path) {
     const historyState = { atlasRoute: route };
-    if (route.kind === "detail") historyState.from = window.location.pathname + window.location.search;
+    if (route.kind === "detail" || route.kind === "knowledge-node") historyState.from = window.location.pathname + window.location.search;
     window.history[replace ? "replaceState" : "pushState"](historyState, "", path);
   }
   await applyRoute(route);
@@ -451,7 +475,28 @@ function navigateBackFromDetail(category) {
 
 async function applyRoute(route) {
   if (!route) route = routeFromLocation();
+  if (state.route?.kind === "settings" && route.kind !== "settings") clearAgentKeySecret();
   state.route = route;
+  if (route.kind.startsWith("knowledge")) {
+    closeSidebar();
+    closeDetail({ navigate: false });
+    state.detailMode = "page";
+    state.trash = false;
+    state.query = "";
+    $("#global-search").value = "";
+    await loadKnowledge(route);
+    return;
+  }
+  if (route.kind === "settings") {
+    closeSidebar();
+    closeDetail({ navigate: false });
+    state.detailMode = "page";
+    state.trash = false;
+    state.query = "";
+    $("#global-search").value = "";
+    await loadSettings();
+    return;
+  }
   state.filter = route.kind === "list" && FILTERS[route.category]?.includes(route.filter) ? route.filter : "all";
   if (route.kind === "list" && ["cards", "list"].includes(route.view)) state.view = route.view;
   state.category = route.category || state.category || "person";
@@ -485,9 +530,12 @@ function updateHeading() {
   $("#view-description").textContent = state.trash ? "Restore entries you still need, or clean them up permanently." : state.query ? `Matches for “${state.query}”` : relationshipMeta?.description || meta.description;
   $("#new-record").hidden = state.trash || Boolean(state.query);
   $("#new-record-top").hidden = state.trash;
+  $("#new-record span:last-child").textContent = "Add entry";
+  $("#new-record-top .button-label").textContent = "Add entry";
   $("#empty-trash").hidden = true;
   $$(".category-nav .nav-row").forEach((button) => button.classList.toggle("active", !state.trash && !state.query && button.dataset.category === state.category));
-  $("#trash-button").classList.toggle("active", state.trash);
+  $("[data-workspace='knowledge']")?.classList.remove("active");
+  $("#settings-button")?.classList.toggle("active", state.trash);
   const canToggle = !state.trash && !state.query && !["experience", "goal", "person"].includes(state.category) &&
     !(state.category === "relationship" && state.filter === "all");
   $("#view-toggle").hidden = !canToggle;
@@ -665,7 +713,7 @@ function renderGoals(records) {
     const column = element("section", { class: "goal-column" }, element("header", { class: "goal-column-head" }, [element("h2", { text: label }), element("span", { text: `${inHorizon.length} ${inHorizon.length === 1 ? "goal" : "goals"}` })]));
     const stack = element("div", { class: "goal-stack" });
     roots.forEach((record, index) => {
-      const cardChildren = [element("h3", { text: recordTitle(record) }), element("p", { text: recordSummary(record) || "No progress note yet." })];
+      const cardChildren = [element("div", { class: "goal-card-meta" }, [element("span", { text: `${friendly(record.data?.importance || "medium")} importance` })]), element("h3", { text: recordTitle(record) }), element("p", { text: recordSummary(record) || "No description yet." })];
       const descendants = renderGoalDescendants(record.id, records);
       if (descendants) cardChildren.push(descendants);
       cardChildren.push(openRecordButton(record));
@@ -1038,6 +1086,295 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
   }
 }
 
+function setKnowledgeChrome() {
+  $("#view-heading").classList.add("route-hidden");
+  $("#filter-bar").replaceChildren();
+  $("#view-toggle").hidden = true;
+  $("#empty-trash").hidden = true;
+  $("#new-record").hidden = true;
+  $("#new-record-top").hidden = true;
+  $$(".category-nav .nav-row").forEach((button) => button.classList.toggle("active", button.dataset.workspace === "knowledge"));
+  $("#settings-button")?.classList.remove("active");
+}
+
+async function loadKnowledge(route = state.route) {
+  const token = ++state.loadToken;
+  setKnowledgeChrome();
+  renderSkeleton();
+  try {
+    const [treePayload, nodesPayload, selectedPayload] = await Promise.all([
+      api("/knowledge/tree"), api("/knowledge/nodes"),
+      route.kind === "knowledge-node" ? api(`/knowledge/nodes/${encodeURIComponent(route.id)}`) : Promise.resolve(null)
+    ]);
+    if (token !== state.loadToken) return;
+    state.knowledge.branches = listPayload(treePayload, "branches");
+    state.knowledge.nodes = listPayload(nodesPayload, "nodes");
+    state.knowledge.selected = selectedPayload?.node || selectedPayload || null;
+    if (!state.knowledge.disclosureInitialized) {
+      const parentIds = new Set(state.knowledge.nodes.map((node) => node.parentId).filter((id) => id != null));
+      state.knowledge.collapsedNodes = new Set(parentIds);
+      state.knowledge.disclosureInitialized = true;
+    }
+    const validIds = new Set(state.knowledge.nodes.map((node) => node.id));
+    state.knowledge.collapsedNodes = new Set([...state.knowledge.collapsedNodes].filter((id) => validIds.has(id)));
+    renderKnowledgeWorkspace(route);
+    $("#main-content").focus({ preventScroll: true });
+  } catch (error) {
+    if (error.status === 401 || error.status === 423) return lockLocally();
+    renderFailure(error);
+  }
+}
+
+function knowledgeBranchLabel(branch) { return branch === "subjects" ? "Subjects" : "Ideologies"; }
+
+function knowledgePath(node) {
+  const names = [node.name];
+  let cursor = node;
+  const byId = new Map(state.knowledge.nodes.map((item) => [item.id, item]));
+  while (cursor?.parentId != null) { cursor = byId.get(cursor.parentId); if (cursor) names.unshift(cursor.name); }
+  names.unshift(knowledgeBranchLabel(node.branch));
+  return names;
+}
+
+function renderKnowledgeWorkspace(route) {
+  const stage = $("#content-stage");
+  stage.replaceChildren();
+  const layout = element("div", { class: "knowledge-layout" });
+  layout.append(renderKnowledgeTree());
+  const content = element("section", { class: "knowledge-content" });
+  if (route.kind === "knowledge-node" && state.knowledge.selected) content.append(renderKnowledgeNode(state.knowledge.selected));
+  else if (route.kind === "knowledge-branch") content.append(renderKnowledgeBranch(route.branch));
+  else content.append(renderKnowledgeWelcome());
+  layout.append(content);
+  stage.append(layout);
+}
+
+function renderKnowledgeTree() {
+  const nodes = state.knowledge.nodes;
+  const counts = {
+    known: nodes.filter((node) => node.status === "known").length,
+    unknown: nodes.filter((node) => node.status === "unknown").length,
+    unassessed: nodes.filter((node) => node.status === "unassessed").length
+  };
+  const panel = element("aside", { class: "knowledge-tree-panel", "aria-label": "Knowledge tree" });
+  panel.append(element("header", { class: "knowledge-tree-head" }, [
+    element("div", {}, [
+      element("p", { class: "eyebrow", text: "Structure" }),
+      element("h2", { text: "Knowledge" }),
+      element("p", { class: "knowledge-tree-tagline", text: "What you understand, how it narrows, and where the frontier begins." })
+    ]),
+    element("button", { class: "icon-button", type: "button", "aria-label": "Add concept", onclick: () => openKnowledgeNodeDialog() }, icon("plus"))
+  ]));
+  panel.append(element("div", { class: "knowledge-summary", "aria-label": "Knowledge summary" }, [
+    knowledgeSummaryItem(counts.known, "Known", "known"), knowledgeSummaryItem(counts.unknown, "Unknown", "unknown"), knowledgeSummaryItem(counts.unassessed, "Unassessed", "unassessed")
+  ]));
+  panel.append(element("div", { class: "knowledge-tree-controls" }, [
+    element("button", { class: "text-button", type: "button", text: "Collapse all", onclick: () => {
+      state.knowledge.collapsedBranches = new Set(state.knowledge.branches.map((branch) => branch.id));
+      state.knowledge.collapsedNodes = new Set(state.knowledge.nodes.filter((node) => state.knowledge.nodes.some((item) => item.parentId === node.id)).map((node) => node.id));
+      renderKnowledgeWorkspace(state.route);
+    } }),
+    element("span", { text: "/" }),
+    element("button", { class: "text-button", type: "button", text: "Expand all", onclick: () => {
+      state.knowledge.collapsedBranches.clear(); state.knowledge.collapsedNodes.clear(); renderKnowledgeWorkspace(state.route);
+    } })
+  ]));
+  const tree = element("nav", { class: "knowledge-tree", "aria-label": "Concepts" });
+  state.knowledge.branches.forEach((branch) => tree.append(renderKnowledgeBranchTree(branch)));
+  panel.append(tree);
+  return panel;
+}
+
+function knowledgeSummaryItem(value, label, status) {
+  return element("div", { class: `knowledge-summary-item ${status}` }, [element("strong", { text: value }), element("span", { text: label })]);
+}
+
+function renderKnowledgeBranchTree(branch) {
+  const collapsed = state.knowledge.collapsedBranches.has(branch.id);
+  const wrapper = element("div", { class: "knowledge-tree-group" });
+  const row = element("div", { class: "knowledge-tree-row branch" }, [
+    element("button", { class: `knowledge-tree-toggle${collapsed ? "" : " expanded"}`, type: "button", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${branch.name}`, onclick: () => {
+      if (collapsed) state.knowledge.collapsedBranches.delete(branch.id); else state.knowledge.collapsedBranches.add(branch.id);
+      renderKnowledgeWorkspace(state.route);
+    } }, icon("chevron")),
+    element("button", { class: `knowledge-tree-button${state.route.kind === "knowledge-branch" && state.route.branch === branch.id ? " selected" : ""}`, type: "button", onclick: () => navigateTo({ kind: "knowledge-branch", branch: branch.id }) }, [
+      element("span", { class: "knowledge-status branch" }), element("span", { text: branch.name }), element("small", { text: branch.children?.length || 0 })
+    ])
+  ]);
+  wrapper.append(row);
+  if (!collapsed) {
+    const children = element("div", { class: "knowledge-tree-children" });
+    (branch.children || []).forEach((node) => children.append(renderKnowledgeTreeNode(node)));
+    wrapper.append(children);
+  }
+  return wrapper;
+}
+
+function renderKnowledgeTreeNode(node) {
+  const collapsed = state.knowledge.collapsedNodes.has(node.id);
+  const hasChildren = Boolean(node.children?.length);
+  const wrapper = element("div", { class: "knowledge-tree-group" });
+  wrapper.append(element("div", { class: "knowledge-tree-row" }, [
+    hasChildren ? element("button", { class: `knowledge-tree-toggle${collapsed ? "" : " expanded"}`, type: "button", "aria-label": `${collapsed ? "Expand" : "Collapse"} ${node.name}`, onclick: () => {
+      if (collapsed) state.knowledge.collapsedNodes.delete(node.id); else state.knowledge.collapsedNodes.add(node.id);
+      renderKnowledgeWorkspace(state.route);
+    } }, icon("chevron")) : element("span", { class: "knowledge-tree-toggle-spacer" }),
+    element("button", { class: `knowledge-tree-button${state.route.kind === "knowledge-node" && Number(state.route.id) === node.id ? " selected" : ""}`, type: "button", onclick: () => navigateTo({ kind: "knowledge-node", id: node.id }) }, [
+      element("span", { class: `knowledge-status ${node.status}` }), element("span", { text: node.name }), hasChildren ? element("small", { text: node.children.length }) : null
+    ])
+  ]));
+  if (hasChildren && !collapsed) {
+    const children = element("div", { class: "knowledge-tree-children" });
+    node.children.forEach((child) => children.append(renderKnowledgeTreeNode(child)));
+    wrapper.append(children);
+  }
+  return wrapper;
+}
+
+function renderKnowledgeWelcome() {
+  return element("div", { class: "knowledge-welcome" }, [
+    element("span", { class: "knowledge-orbit" }, icon("knowledge")),
+    element("p", { class: "eyebrow", text: "A broad map, ready to become yours" }),
+    element("h2", { text: "Begin with something you understand." }),
+    element("p", { text: "Choose Subjects for descriptive knowledge or Ideologies for normative and interpretive frameworks. A child should narrow the concept above it." }),
+    element("button", { class: "button button-primary", type: "button", onclick: () => openKnowledgeNodeDialog(), text: "Add a concept" })
+  ]);
+}
+
+function renderKnowledgeBranch(branchId) {
+  const branch = state.knowledge.branches.find((item) => item.id === branchId);
+  const subjects = branchId === "subjects";
+  return element("article", { class: "knowledge-branch-view" }, [
+    element("p", { class: "eyebrow", text: "Primary branch" }),
+    element("h2", { text: branch?.name || knowledgeBranchLabel(branchId) }),
+    element("p", { class: "knowledge-lead", text: branch?.description || (subjects ? "Concepts that describe reality, mechanisms, systems, events, and formal relationships." : "Normative, philosophical, political, religious, spiritual, and interpretive frameworks.") }),
+    element("div", { class: "knowledge-rule-card" }, [element("span", { text: subjects ? "01" : "02" }), element("p", { text: subjects ? "Use conceptual narrowing for subfields, types, components, and more specific questions." : "Map a framework without implying endorsement; children should be more specific positions or interpretations." })]),
+    element("button", { class: "button button-primary", type: "button", onclick: () => openKnowledgeNodeDialog({ branch: branchId }), text: "Add concept here" })
+  ]);
+}
+
+function inheritedKnowledgeTerms(node) {
+  const byId = new Map(state.knowledge.nodes.map((item) => [item.id, item]));
+  const chain = [];
+  let cursor = node;
+  while (cursor) { chain.unshift(cursor); cursor = cursor.parentId == null ? null : byId.get(cursor.parentId); }
+  return chain.flatMap((owner) => (owner.terms || []).map((term) => ({ ...term, source: owner.name })));
+}
+
+function renderKnowledgeNode(node) {
+  const root = element("article", { class: "knowledge-node-view" });
+  root.append(element("button", { class: "detail-back knowledge-back", type: "button", onclick: () => navigateTo({ kind: "knowledge-branch", branch: node.branch }) }, [element("span", { class: "detail-back-icon" }, icon("chevron")), `Back to ${knowledgeBranchLabel(node.branch)}`]));
+  root.append(element("header", { class: "knowledge-node-head" }, [
+    element("div", {}, [element("p", { class: "eyebrow", text: knowledgePath(node).join(" / ") }), element("h2", { text: node.name })]),
+    element("span", { class: `knowledge-status-badge ${node.status}`, text: friendly(node.status) })
+  ]));
+  if (node.status === "known") root.append(element("section", { class: "knowledge-explanation" }, [element("p", { class: "section-label", text: "Explanation" }), element("p", { text: node.understanding })]));
+  const terms = inheritedKnowledgeTerms(node);
+  const termsList = element("dl", { class: "knowledge-terms" });
+  terms.forEach((term) => termsList.append(element("div", {}, [element("dt", {}, [element("span", { text: term.label }), element("small", { text: term.source })]), element("dd", { text: term.definition })])));
+  if (!terms.length) termsList.append(element("p", { class: "detail-empty", text: "No terms have been defined along this path." }));
+  root.append(detailSection("Terms", null, termsList));
+  const connections = element("div", { class: "linked-list" });
+  (node.connections || []).forEach((connection) => connections.append(element("div", { class: "linked-item" }, [
+    element("span", {}, icon("link")), element("div", { class: "linked-copy" }, [element("strong", { text: connection.node.name }), element("small", { text: `${knowledgeBranchLabel(connection.node.branch)} · ${friendly(connection.node.status)}` })]),
+    element("div", { class: "linked-actions" }, [element("button", { class: "compact-delete", type: "button", "aria-label": `Delete connection to ${connection.node.name}`, onclick: () => removeKnowledgeConnection(connection) }, icon("trash")), element("button", { class: "icon-button compact-open", type: "button", "aria-label": `Open ${connection.node.name}`, onclick: () => navigateTo({ kind: "knowledge-node", id: connection.node.id }) }, icon("chevron"))])
+  ])));
+  if (!connections.childNodes.length) connections.append(element("p", { class: "detail-empty", text: "No cross-connections yet." }));
+  root.append(detailSection("Connections", element("button", { class: "text-button", type: "button", text: "Add connection", onclick: openKnowledgeConnectionDialog }), connections));
+  root.append(element("section", { class: "knowledge-node-meta" }, [element("div", {}, [element("span", { text: "Branch" }), element("strong", { text: knowledgeBranchLabel(node.branch) })]), element("div", {}, [element("span", { text: "Children" }), element("strong", { text: node.childCount || 0 })]), element("div", {}, [element("span", { text: "Revision" }), element("strong", { text: node.revision })])]));
+  root.append(element("div", { class: "knowledge-node-actions" }, [
+    node.status === "known" ? element("button", { class: "button button-primary", type: "button", text: "Add child", onclick: () => openKnowledgeNodeDialog({ branch: node.branch, parentId: node.id }) }) : null,
+    element("button", { class: "button button-secondary", type: "button", text: "Edit", onclick: () => openKnowledgeNodeDialog({ node }) }),
+    element("button", { class: "button button-secondary danger-button", type: "button", text: "Delete", onclick: deleteKnowledgeNode })
+  ]));
+  return root;
+}
+
+function knowledgeDescendantIds(id) {
+  const found = new Set([id]);
+  let changed = true;
+  while (changed) { changed = false; for (const node of state.knowledge.nodes) if (node.parentId != null && found.has(node.parentId) && !found.has(node.id)) { found.add(node.id); changed = true; } }
+  return found;
+}
+
+function populateKnowledgeParents(branch, selectedParentId = null, editingId = null) {
+  const select = $("#knowledge-node-form select[name='parentId']");
+  select.replaceChildren(element("option", { value: "", text: `Directly under ${knowledgeBranchLabel(branch)}` }));
+  const excluded = editingId == null ? new Set() : knowledgeDescendantIds(editingId);
+  state.knowledge.nodes.filter((node) => node.branch === branch && node.status === "known" && !excluded.has(node.id)).sort((a, b) => a.name.localeCompare(b.name)).forEach((node) => select.append(element("option", { value: node.id, text: knowledgePath(node).join(" / "), selected: node.id === selectedParentId })));
+}
+
+function syncKnowledgeUnderstanding() {
+  const form = $("#knowledge-node-form");
+  const known = form.elements.status.value === "known";
+  $("#knowledge-understanding-field").hidden = !known;
+  form.elements.understanding.required = known;
+  if (!known) form.elements.understanding.value = "";
+}
+
+function openKnowledgeNodeDialog({ node = null, branch = state.route?.branch || state.knowledge.selected?.branch || "subjects", parentId = null } = {}) {
+  const form = $("#knowledge-node-form");
+  form.reset();
+  form.elements.id.value = node?.id || "";
+  form.elements.name.value = node?.name || "";
+  form.elements.branch.value = node?.branch || branch;
+  form.elements.status.value = node?.status || "unassessed";
+  form.elements.understanding.value = node?.understanding || "";
+  $("#knowledge-node-dialog-title").textContent = node ? "Edit concept" : parentId ? "Add child concept" : "Add concept";
+  populateKnowledgeParents(form.elements.branch.value, node?.parentId ?? parentId, node?.id ?? null);
+  syncKnowledgeUnderstanding();
+  $("#knowledge-node-dialog").showModal();
+  setTimeout(() => form.elements.name.focus(), 30);
+}
+
+async function saveKnowledgeNode(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  const id = form.elements.id.value;
+  const body = { name: form.elements.name.value.trim(), branch: form.elements.branch.value, parentId: form.elements.parentId.value ? Number(form.elements.parentId.value) : null, status: form.elements.status.value, understanding: form.elements.status.value === "known" ? form.elements.understanding.value.trim() : null };
+  const button = $("#save-knowledge-node"); setButtonBusy(button, true, "Saving…");
+  try {
+    const payload = await api(id ? `/knowledge/nodes/${encodeURIComponent(id)}` : "/knowledge/nodes", { method: id ? "PATCH" : "POST", body });
+    const saved = payload?.node || payload;
+    $("#knowledge-node-dialog").close(); notify(id ? "Concept updated." : "Concept added.", "success");
+    await refreshCounts(); await navigateTo({ kind: "knowledge-node", id: saved.id });
+  } catch (error) { notify(error.message, "error"); }
+  finally { setButtonBusy(button, false); }
+}
+
+async function deleteKnowledgeNode() {
+  const node = state.knowledge.selected;
+  if (!node || !confirm(`Delete “${node.name}”? This cannot be undone.`)) return;
+  try { await api(`/knowledge/nodes/${encodeURIComponent(node.id)}`, { method: "DELETE" }); notify("Concept deleted.", "success"); await refreshCounts(); await navigateTo({ kind: "knowledge-branch", branch: node.branch }, { replace: true }); }
+  catch (error) { notify(error.message, "error"); }
+}
+
+function openKnowledgeConnectionDialog() {
+  const node = state.knowledge.selected;
+  if (!node) return;
+  const select = $("#knowledge-connection-form select[name='targetId']");
+  const connected = new Set((node.connections || []).map((connection) => connection.node.id)); connected.add(node.id);
+  select.replaceChildren();
+  state.knowledge.nodes.filter((candidate) => !connected.has(candidate.id)).sort((a, b) => a.name.localeCompare(b.name)).forEach((candidate) => select.append(element("option", { value: candidate.id, text: `${candidate.name} · ${knowledgeBranchLabel(candidate.branch)}` })));
+  if (!select.options.length) return notify("Every available concept is already connected.");
+  $("#knowledge-connection-dialog").showModal();
+}
+
+async function saveKnowledgeConnection(event) {
+  event.preventDefault();
+  const node = state.knowledge.selected; if (!node) return;
+  const button = event.currentTarget.querySelector("button[type='submit']"); setButtonBusy(button, true, "Adding…");
+  try { await api("/knowledge/connections", { method: "POST", body: { sourceId: node.id, targetId: Number(event.currentTarget.elements.targetId.value) } }); $("#knowledge-connection-dialog").close(); notify("Connection added.", "success"); await loadKnowledge(state.route); }
+  catch (error) { notify(error.message, "error"); } finally { setButtonBusy(button, false); }
+}
+
+async function removeKnowledgeConnection(connection) {
+  if (!confirm(`Delete the connection to “${connection.node.name}”?`)) return;
+  try { await api(`/knowledge/connections/${encodeURIComponent(connection.id)}`, { method: "DELETE" }); notify("Connection deleted.", "success"); await loadKnowledge(state.route); }
+  catch (error) { notify(error.message, "error"); }
+}
+
 function renderGoalProgression(record) {
   const body = element("div", { class: "goal-progression-loading" }, [
     element("div", { class: "progress-skeleton" }),
@@ -1190,6 +1527,7 @@ function openSubgoalDialog(goal) {
       element("label", { class: "field full" }, [element("span", { text: "Subgoal" }), element("input", { name: "title", maxlength: 160, required: true, placeholder: "A concrete outcome" })]),
       element("label", { class: "field" }, [element("span", { text: "Target date" }), element("input", { name: "targetDate", placeholder: "YYYY-MM-DD" })]),
       element("label", { class: "field" }, [element("span", { text: "Progress" }), element("input", { name: "progress", type: "number", min: 0, max: 100, step: 1, value: 0, required: true })]),
+      element("label", { class: "field" }, [element("span", { text: "Importance" }), element("select", { name: "importance", required: true }, [element("option", { value: "low", text: "Low" }), element("option", { value: "medium", text: "Medium", selected: true }), element("option", { value: "high", text: "High" })])]),
       element("label", { class: "field full" }, [element("span", { text: "Description" }), element("textarea", { name: "description", placeholder: "What this step means and any context worth keeping" })]),
       element("fieldset", { class: "subgoal-prerequisite-field full" }, [element("legend", { text: "Follows (optional)" }), element("div", { class: "subgoal-prerequisite-options", text: "Loading existing subgoals…" })])
     ]),
@@ -1215,7 +1553,7 @@ async function saveSubgoal(event, goal, dialog) {
   try {
     const createdPayload = await api("/records", { method: "POST", body: {
       category: "goal", title: form.elements.title.value.trim(), parentId: goal.id,
-      data: { horizon: goal.data?.horizon || "short", targetDate: form.elements.targetDate.value.trim(), description: form.elements.description.value.trim(), progress: Number(form.elements.progress.value) },
+      data: { horizon: goal.data?.horizon || "short", importance: form.elements.importance.value, targetDate: form.elements.targetDate.value.trim(), description: form.elements.description.value.trim(), progress: Number(form.elements.progress.value) },
       customFieldValues: {}
     } });
     const created = recordPayload(createdPayload);
@@ -1344,6 +1682,7 @@ async function openRecordDialog(record = null) {
   (FIELD_DEFS[category] || []).forEach((definition) => {
     let value = definition[0] === "title" ? record?.title : category === "person" ? personData(record)[definition[0]] : record?.data?.[definition[0]];
     if (!record && category === "relationship" && definition[0] === "kind" && relationshipKind(state.filter)) value = state.filter;
+    if (!record && category === "goal" && definition[0] === "importance") value = "medium";
     fields.append(inputForDefinition(definition, value ?? ""));
   });
   if (category === "person") {
@@ -1671,6 +2010,219 @@ async function savePrompts(event) {
   finally { setButtonBusy(button, false); }
 }
 
+function setSettingsChrome() {
+  $("#view-heading").classList.remove("route-hidden");
+  $("#view-eyebrow").textContent = "Atlas controls";
+  $("#view-title").textContent = "Settings";
+  $("#view-description").textContent = "Manage local access, review the agent contract, and open maintenance tools.";
+  $("#filter-bar").replaceChildren();
+  $("#view-toggle").hidden = true;
+  $("#empty-trash").hidden = true;
+  $("#new-record").hidden = true;
+  $("#new-record-top").hidden = true;
+  $$(".category-nav .nav-row").forEach((button) => button.classList.remove("active"));
+  $("#settings-button")?.classList.add("active");
+}
+
+async function loadSettings() {
+  const token = ++state.loadToken;
+  setSettingsChrome();
+  renderSkeleton();
+  try {
+    const [keyStatus, reference] = await Promise.all([api("/agent-key"), api("/settings/api-reference")]);
+    if (token !== state.loadToken) return;
+    renderSettings(keyStatus, reference);
+    $("#main-content").focus({ preventScroll: true });
+  } catch (error) {
+    if (error.status === 401 || error.status === 423) return lockLocally();
+    renderFailure(error);
+  }
+}
+
+function renderSettings(keyStatus, reference) {
+  const stage = $("#content-stage");
+  stage.replaceChildren();
+  const page = element("div", { class: "settings-page" });
+
+  const maintenance = element("section", { class: "settings-grid", "aria-label": "Atlas maintenance" });
+  maintenance.append(element("article", { class: "settings-card" }, [
+    element("div", { class: "settings-card-icon" }, icon("trash")),
+    element("div", { class: "settings-card-copy" }, [
+      element("p", { class: "eyebrow", text: "Maintenance" }),
+      element("h2", { text: "Recently removed" }),
+      element("p", { text: "Restore entries or permanently remove their history, links, and attachments." })
+    ]),
+    element("div", { class: "settings-card-action" }, [
+      element("span", { id: "trash-count", class: "settings-count", text: state.trashCount }),
+      element("button", { class: "button button-secondary", type: "button", text: "Open recently removed", onclick: () => navigateTo({ kind: "trash", category: state.category }) })
+    ])
+  ]));
+
+  const agentCard = element("article", { id: "agent-access-panel", class: "settings-card settings-agent-card" }, [
+    element("div", { class: "settings-card-icon" }, icon("key")),
+    element("div", { class: "settings-card-copy" }, [
+      element("p", { class: "eyebrow", text: "Read-only integration" }),
+      element("h2", { text: "Agent access" }),
+      element("p", { text: "One local key can read only the documented Person, Experience, Goal, and Project projections while Atlas is unlocked." }),
+      element("div", { id: "agent-key-status", class: "agent-key-status", "aria-live": "polite" }),
+      element("div", { id: "agent-key-secret", class: "agent-key-secret", hidden: true }, [
+        element("label", { class: "field" }, [element("span", { text: "Copy this key now" }), element("input", { id: "agent-key-value", type: "text", readonly: true, spellcheck: "false" })]),
+        element("p", { class: "microcopy", text: "Atlas stores only a verifier. This key will not be shown again." }),
+        element("button", { id: "copy-agent-key", class: "button button-secondary button-wide", type: "button", text: "Copy key", onclick: copyAgentKey })
+      ])
+    ]),
+    element("div", { class: "settings-card-action settings-agent-actions" }, [
+      element("button", { id: "revoke-agent-key", class: "button button-quiet", type: "button", text: "Revoke", hidden: true, onclick: revokeAgentKey }),
+      element("button", { id: "generate-agent-key", class: "button button-primary", type: "button", text: "Generate key", onclick: generateAgentKey })
+    ])
+  ]);
+  maintenance.append(agentCard);
+  page.append(maintenance);
+
+  const spec = reference?.agentOpenapi || {};
+  const tools = new Map((reference?.tools || []).map((tool) => [tool.endpoint, tool]));
+  const endpointList = element("div", { class: "api-endpoint-list" });
+  for (const [path, methods] of Object.entries(spec.paths || {})) {
+    for (const [method, operation] of Object.entries(methods)) {
+      const tool = tools.get(path);
+      const responses = Object.keys(operation.responses || {}).join(" · ");
+      endpointList.append(element("article", { class: "api-endpoint" }, [
+        element("header", { class: "api-endpoint-head" }, [
+          element("span", { class: `api-method ${method}`, text: method.toUpperCase() }),
+          element("code", { text: path })
+        ]),
+        element("h3", { text: operation.summary || tool?.name || path }),
+        element("p", { text: tool?.description || operation.description || "Authenticated agent resource." }),
+        element("div", { class: "api-endpoint-meta" }, [
+          element("span", { text: method === "post" ? "Input: {} only" : "No request body" }),
+          element("span", { text: `Responses: ${responses}` })
+        ]),
+        element("details", { class: "api-schema" }, [
+          element("summary", { text: "View operation specification" }),
+          element("pre", { text: JSON.stringify(operation, null, 2) })
+        ])
+      ]));
+    }
+  }
+  const apiSection = element("section", { class: "settings-api" }, [
+    element("header", { class: "settings-section-head" }, [
+      element("div", {}, [element("p", { class: "eyebrow", text: "OpenAPI 3.1 · Agent tools" }), element("h2", { text: spec.info?.title || "Agent API" }), element("p", { text: spec.info?.description || "Authenticated, stateless, read-only access." })]),
+      element("div", { class: "api-facts" }, [
+        element("span", {}, [element("strong", { text: "Base" }), element("code", { text: window.location.origin })]),
+        element("span", {}, [element("strong", { text: "Auth" }), element("code", { text: "Bearer atlas_…" })])
+      ])
+    ]),
+    endpointList,
+    element("div", { class: "api-reference-files" }, [
+      element("details", { class: "api-schema" }, [element("summary", { text: "View complete agent guide" }), element("pre", { text: JSON.stringify(reference?.guide || {}, null, 2) })]),
+      element("details", { class: "api-schema" }, [element("summary", { text: "View complete OpenAPI JSON" }), element("pre", { text: JSON.stringify(spec, null, 2) })])
+    ])
+  ]);
+  page.append(apiSection);
+  page.append(renderKnowledgeApiReference(reference?.knowledgeOpenapi || {}));
+  stage.append(page);
+  renderAgentKeyStatus(keyStatus);
+}
+
+function renderKnowledgeApiReference(spec) {
+  const endpointList = element("div", { class: "api-endpoint-list" });
+  for (const [path, pathItem] of Object.entries(spec.paths || {})) {
+    for (const [method, operation] of Object.entries(pathItem)) {
+      if (!["get", "post", "patch", "delete"].includes(method)) continue;
+      const responses = Object.keys(operation.responses || {}).join(" · ");
+      const operationSpec = pathItem.parameters ? { parameters: pathItem.parameters, ...operation } : operation;
+      endpointList.append(element("article", { class: "api-endpoint" }, [
+        element("header", { class: "api-endpoint-head" }, [
+          element("span", { class: `api-method ${method}`, text: method.toUpperCase() }),
+          element("code", { text: path })
+        ]),
+        element("h3", { text: operation.summary || path }),
+        element("p", { text: operation.description || "Epistome-compatible unlocked browser operation." }),
+        element("div", { class: "api-endpoint-meta" }, [
+          element("span", { text: operation.requestBody ? "JSON request body" : "No request body" }),
+          element("span", { text: `Responses: ${responses}` })
+        ]),
+        element("details", { class: "api-schema" }, [
+          element("summary", { text: "View operation specification" }),
+          element("pre", { text: JSON.stringify(operationSpec, null, 2) })
+        ])
+      ]));
+    }
+  }
+  return element("section", { class: "settings-api" }, [
+    element("header", { class: "settings-section-head" }, [
+      element("div", {}, [
+        element("p", { class: "eyebrow", text: "OpenAPI 3.1 · Knowledge browser API" }),
+        element("h2", { text: spec.info?.title || "Knowledge API" }),
+        element("p", { text: spec.info?.description || "Epistome-compatible Knowledge hierarchy and connection operations." })
+      ]),
+      element("div", { class: "api-facts" }, [
+        element("span", {}, [element("strong", { text: "Base" }), element("code", { text: window.location.origin })]),
+        element("span", {}, [element("strong", { text: "Auth" }), element("code", { text: "Unlocked Atlas" })])
+      ])
+    ]),
+    endpointList,
+    element("div", { class: "api-reference-files single" }, [
+      element("details", { class: "api-schema" }, [element("summary", { text: "View complete Knowledge OpenAPI JSON" }), element("pre", { text: JSON.stringify(spec, null, 2) })])
+    ])
+  ]);
+}
+
+function clearAgentKeySecret() {
+  const value = $("#agent-key-value");
+  const secret = $("#agent-key-secret");
+  if (value) value.value = "";
+  if (secret) secret.hidden = true;
+}
+
+function renderAgentKeyStatus(status) {
+  if (!$("#agent-key-status")) return;
+  const configured = Boolean(status?.configured);
+  $("#agent-key-status").replaceChildren(element("div", { class: `agent-key-state${configured ? " configured" : ""}` }, [
+    element("span", {}, icon(configured ? "check" : "key")),
+    element("div", {}, [element("strong", { text: configured ? "Agent key configured" : "No agent key" }), element("p", { text: configured ? `${status.prefix || "atlas_…"}${status.createdAt ? ` · created ${formatTimestamp(status.createdAt)}` : ""}` : "Generate one key when an agent needs read-only access." })])
+  ]));
+  $("#generate-agent-key").textContent = configured ? "Rotate key" : "Generate key";
+  $("#revoke-agent-key").hidden = !configured;
+  $("#agent-access-panel").dataset.configured = String(configured);
+}
+
+async function generateAgentKey() {
+  const configured = $("#agent-access-panel")?.dataset.configured === "true";
+  if (configured && !confirm("Rotate the agent key? The current key will stop working immediately.")) return;
+  const button = $("#generate-agent-key"); setButtonBusy(button, true, configured ? "Rotating…" : "Generating…");
+  try {
+    const result = await api("/agent-key", { method: "POST", body: {} });
+    const secret = result.key || result.apiKey || result.secret;
+    if (!secret) throw new Error("Atlas did not return the generated key.");
+    $("#agent-key-value").value = secret;
+    $("#agent-key-secret").hidden = false;
+    renderAgentKeyStatus(result);
+    button.dataset.original = "Rotate key";
+    $("#agent-key-value").select();
+  } catch (error) { notify(error.message, "error"); }
+  finally { setButtonBusy(button, false); }
+}
+
+async function copyAgentKey() {
+  const value = $("#agent-key-value").value;
+  if (!value) return;
+  try { await navigator.clipboard.writeText(value); notify("Agent key copied.", "success"); }
+  catch { $("#agent-key-value").select(); notify("Copy is unavailable. The key is selected for manual copying."); }
+}
+
+async function revokeAgentKey() {
+  if (!confirm("Revoke the agent key? Existing agent calls will stop working immediately.")) return;
+  const button = $("#revoke-agent-key"); setButtonBusy(button, true, "Revoking…");
+  try { const status = await api("/agent-key", { method: "DELETE", body: {} }); clearAgentKeySecret(); renderAgentKeyStatus(status); notify("Agent key revoked.", "success"); }
+  catch (error) { notify(error.message, "error"); } finally { setButtonBusy(button, false); }
+}
+
+function openPrimaryCreate() {
+  if (state.route?.kind?.startsWith("knowledge")) openKnowledgeNodeDialog();
+  else openRecordDialog();
+}
+
 async function lockAtlas() {
   try { await api("/lock", { method: "POST", body: {} }); }
   catch (error) { notify(error.message, "error"); return; }
@@ -1684,6 +2236,10 @@ function lockLocally() {
   state.customFields = [];
   state.customFieldsCategory = null;
   state.query = "";
+  state.knowledge.branches = [];
+  state.knowledge.nodes = [];
+  state.knowledge.selected = null;
+  clearAgentKeySecret();
   $("#unlock-form").reset();
   showAuth("unlock");
 }
@@ -1716,20 +2272,24 @@ function wireEvents() {
     catch (error) { notify(error.message, "error"); form.elements.passphrase.select(); }
     finally { setButtonBusy(button, false); }
   });
-  $("#new-record").addEventListener("click", () => openRecordDialog());
-  $("#new-record-top").addEventListener("click", () => openRecordDialog());
+  $("#new-record").addEventListener("click", openPrimaryCreate);
+  $("#new-record-top").addEventListener("click", openPrimaryCreate);
   $("#record-form").addEventListener("submit", saveRecord);
   $("#close-detail").addEventListener("click", closeDetail);
   $("#detail-edit").addEventListener("click", () => state.selected && openRecordDialog(state.selected));
   $("#detail-remove").addEventListener("click", removeOrRestore);
-  $("#trash-button").addEventListener("click", async () => { await navigateTo({ kind: "trash", category: state.category }); });
   $("#empty-trash").addEventListener("click", emptyTrash);
   $("#backup-button").addEventListener("click", () => { closeSidebar(); openBackupDialog(); });
+  $("#settings-button").addEventListener("click", () => navigateTo({ kind: "settings" }));
   $("#lock-button").addEventListener("click", lockAtlas);
   $("#open-sidebar").addEventListener("click", openSidebar);
   $("#close-sidebar").addEventListener("click", closeSidebar);
   $("#sidebar-scrim").addEventListener("click", closeSidebar);
   $("#link-form").addEventListener("submit", saveLink);
+  $("#knowledge-node-form").addEventListener("submit", saveKnowledgeNode);
+  $("#knowledge-node-form select[name='branch']").addEventListener("change", (event) => populateKnowledgeParents(event.target.value, null, Number($("#knowledge-node-form").elements.id.value) || null));
+  $("#knowledge-node-form select[name='status']").addEventListener("change", syncKnowledgeUnderstanding);
+  $("#knowledge-connection-form").addEventListener("submit", saveKnowledgeConnection);
   $("#field-form").addEventListener("submit", saveField);
   $("#field-form select[name='fieldType']").addEventListener("change", (event) => {
     $("#field-options-row").hidden = event.target.value !== "singleChoice";

@@ -1,6 +1,6 @@
 # Eidolon-Atlas
 
-Eidolon-Atlas is a private, local atlas of one person's life. It keeps seven
+Eidolon-Atlas is a private, local atlas of one person's life. It keeps eight
 connected kinds of information in one place:
 
 - Person
@@ -10,10 +10,14 @@ connected kinds of information in one place:
 - Resource
 - Relationships
 - Preference
+- Knowledge
 
 The application runs on `127.0.0.1`, stores its data in SQLite, and encrypts
 all personal content with a passphrase-derived key. The browser provides the
-only user interface in this release. Agent access is intentionally deferred.
+primary user interface. A small, read-only agent API is available when
+explicitly enabled with a local API key. Settings contains key management, the
+complete agent API reference, and access to Recently removed; see
+[Agent API](docs/agent-api.md).
 
 ## Requirements
 
@@ -62,5 +66,6 @@ and imports decrypt into a staged area without writing decrypted temporary
 images, then atomically replace the atlas. Backup v1 JSON envelopes remain
 import-compatible.
 
-See [Core model](docs/core-model.md), [Architecture](docs/architecture.md), and
-[Security](docs/security.md) for the product contracts and limitations.
+See [Core model](docs/core-model.md), [Architecture](docs/architecture.md),
+[Security](docs/security.md), and [Agent guide](docs/agent-guide.md) for the
+product contracts and limitations.

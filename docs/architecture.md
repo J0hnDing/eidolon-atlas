@@ -32,9 +32,21 @@ details to full-page views; Person and Preference details remain drawer views.
   clear structural columns; attachment changes do not participate in record
   revisions, and attachments survive trash.
 
-The browser's JSON API is an application interface, not an agent contract.
-There are no agent discovery, tool catalog, OpenAPI, MCP, or autonomous write
-surfaces in v1.
+Knowledge uses the same domain, lock, encryption, migration, and backup
+boundaries as the other workspaces. Structural Knowledge metadata remains
+queryable in SQLite; names, explanations, and terms stay inside encrypted
+payloads. The browser contract is namespaced under `/api/knowledge`.
+
+Atlas also exposes a deliberately small read-only agent contract. Discovery,
+the guide, OpenAPI, and four read operations require a generated Bearer API
+key and an unlocked Atlas. There are no agent mutation routes, MCP surface,
+plaintext Knowledge transfer, or Knowledge reset endpoint.
+
+The unlocked Settings page reads the same server-owned agent tool, guide, and
+OpenAPI objects plus a separate Knowledge OpenAPI document through
+`/api/settings/api-reference`; this browser route is not part of the
+Bearer-authenticated agent surface. Settings also owns key management and
+navigation into Recently removed.
 
 ## Reads and search
 

@@ -2,7 +2,7 @@ import { createReadStream, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { open, rm, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { openDatabase, transaction } from './database.js';
 import {
   BACKUP_V2_MAGIC, BACKUP_V2_MAX_HEADER_BYTES, BACKUP_V2_MAX_MANIFEST_BYTES, DEFAULT_KDF, createBackupEnvelope,
@@ -14,9 +14,14 @@ import {
   requireObject, requireRevision, validateCustomFieldValue,
 } from './domain.js';
 import { AtlasError, fail } from './errors.js';
+import {
+  KNOWLEDGE_BRANCHES, KNOWLEDGE_SEED_KEY, createInitialKnowledgeSnapshot, knowledgeId,
+  normalizeKnowledgeBranch, normalizeKnowledgeContent, normalizeKnowledgeName, validateKnowledgeSnapshot,
+} from './knowledge.js';
 
 const KEY_CONFIG = 'encryption-config';
 const KEY_CHECK = 'key-check';
+const AGENT_KEY = 'agent-key';
 export const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const IMAGE_MAX_PER_EXPERIENCE = 50;
 export const BACKUP_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
@@ -31,14 +36,19 @@ function integerPosition(value) {
 }
 
 function goalDataWithoutLegacyText(data) {
-  if (!Object.hasOwn(data ?? {}, 'progressNote') && !Object.hasOwn(data ?? {}, 'motivation')) return data;
+  const hasLegacyText = Object.hasOwn(data ?? {}, 'progressNote') || Object.hasOwn(data ?? {}, 'motivation');
+  const hasImportance = Object.hasOwn(data ?? {}, 'importance');
+  if (!hasLegacyText && hasImportance) return data;
   const next = { ...(data ?? {}) };
-  const descriptions = [next.description, next.motivation, next.progressNote]
-    .filter((value) => typeof value === 'string' && value.trim())
-    .filter((value, index, values) => values.indexOf(value) === index);
-  next.description = descriptions.join('\n\n');
-  delete next.progressNote;
-  delete next.motivation;
+  if (hasLegacyText) {
+    const descriptions = [next.description, next.motivation, next.progressNote]
+      .filter((value) => typeof value === 'string' && value.trim())
+      .filter((value, index, values) => values.indexOf(value) === index);
+    next.description = descriptions.join('\n\n');
+    delete next.progressNote;
+    delete next.motivation;
+  }
+  if (!hasImportance) next.importance = 'medium';
   return next;
 }
 
@@ -104,6 +114,7 @@ export class Atlas {
         this.#setMeta(KEY_CHECK, check);
       });
       this.#replaceKey(key);
+      this.#seedKnowledge();
       return this.status();
     } catch (error) {
       key.fill(0);
@@ -131,7 +142,8 @@ export class Atlas {
     }
     this.#replaceKey(key);
     this.#migrateRelationshipKinds();
-    this.#migrateGoalTextFields();
+    this.#migrateGoalData();
+    this.#seedKnowledge();
     return this.status();
   }
 
@@ -139,6 +151,249 @@ export class Atlas {
     if (this.#key) this.#key.fill(0);
     this.#key = null;
     return this.status();
+  }
+
+  listKnowledgeNodes() {
+    this.#requireUnlocked();
+    return this.#db.prepare('SELECT * FROM knowledge_nodes').all()
+      .map((row) => this.#knowledgeNodeFromRow(row))
+      .sort((left, right) => left.name.localeCompare(right.name, 'en-US', { sensitivity: 'base' }) || left.id - right.id);
+  }
+
+  getKnowledgeTree() {
+    this.#requireUnlocked();
+    const byParent = new Map();
+    for (const node of this.listKnowledgeNodes()) {
+      const key = node.parentId ?? `branch:${node.branch}`;
+      const siblings = byParent.get(key) ?? [];
+      siblings.push(node);
+      byParent.set(key, siblings);
+    }
+    const build = (node) => ({ ...node, children: (byParent.get(node.id) ?? []).map(build) });
+    return KNOWLEDGE_BRANCHES.map((branch) => ({ ...branch, virtual: true,
+      children: (byParent.get(`branch:${branch.id}`) ?? []).map(build) }));
+  }
+
+  getKnowledgeNode(value) {
+    this.#requireUnlocked();
+    const id = knowledgeId(value);
+    const node = this.#knowledgeNodeFromRow(this.#knowledgeNodeRow(id));
+    const connections = this.#db.prepare(`SELECT * FROM knowledge_connections
+      WHERE source_id = ? OR target_id = ? ORDER BY created_at, id`).all(id, id).map((connection) => {
+      const otherId = connection.source_id === id ? connection.target_id : connection.source_id;
+      const other = this.#knowledgeNodeFromRow(this.#knowledgeNodeRow(otherId));
+      return { id: connection.id, node: { id: other.id, name: other.name, branch: other.branch, status: other.status } };
+    }).sort((left, right) => left.node.name.localeCompare(right.node.name, 'en-US', { sensitivity: 'base' }));
+    const childCount = this.#db.prepare('SELECT count(*) AS count FROM knowledge_nodes WHERE parent_id = ?').get(id).count;
+    return { ...node, childCount, connections };
+  }
+
+  createKnowledgeNode(input) {
+    this.#requireUnlocked();
+    requireObject(input);
+    if (Object.hasOwn(input, 'description')) fail(400, 'UNEXPECTED_FIELD', 'Nodes no longer accept a description field.', { fields: ['description'] });
+    const name = normalizeKnowledgeName(input.name);
+    const branch = normalizeKnowledgeBranch(input.branch);
+    const parentId = input.parentId == null ? null : knowledgeId(input.parentId, 'parentId');
+    const content = normalizeKnowledgeContent(input.status ?? 'unassessed', input.understanding, input.terms ?? []);
+    if (parentId !== null) {
+      const parent = this.getKnowledgeNode(parentId);
+      if (parent.branch !== branch) fail(400, 'BRANCH_MISMATCH', 'A child must belong to the same branch as its parent.');
+      if (parent.status !== 'known') fail(409, 'PARENT_NOT_KNOWN', 'Only a known node may be decomposed into children.');
+    }
+    this.#assertUniqueKnowledgeSibling(name, branch, parentId);
+    const timestamp = now();
+    let id;
+    transaction(this.#db, () => {
+      const result = this.#db.prepare(`INSERT INTO knowledge_nodes
+        (branch, parent_id, status, revision, created_at, updated_at, payload)
+        VALUES (?, ?, ?, 1, ?, ?, ?)`)
+        .run(branch, parentId, content.status, timestamp, timestamp, '{}');
+      id = Number(result.lastInsertRowid);
+      this.#db.prepare('UPDATE knowledge_nodes SET payload = ? WHERE id = ?').run(
+        this.#encryptKnowledgeNode(id, 1, branch, { name, understanding: content.understanding, terms: content.terms }), id);
+      if (parentId !== null) this.#touchKnowledgeNode(parentId, timestamp);
+    });
+    return this.getKnowledgeNode(id);
+  }
+
+  patchKnowledgeNode(value, input) {
+    this.#requireUnlocked();
+    requireObject(input);
+    if (Object.hasOwn(input, 'description')) fail(400, 'UNEXPECTED_FIELD', 'Nodes no longer accept a description field.', { fields: ['description'] });
+    const id = knowledgeId(value);
+    const current = this.getKnowledgeNode(id);
+    const name = input.name === undefined ? current.name : normalizeKnowledgeName(input.name);
+    let parentId = input.parentId === undefined ? current.parentId : input.parentId == null ? null : knowledgeId(input.parentId, 'parentId');
+    let branch = input.branch === undefined ? current.branch : normalizeKnowledgeBranch(input.branch);
+    const status = input.status === undefined ? current.status : input.status;
+    const understanding = input.understanding === undefined ? current.understanding : input.understanding;
+    const termsInput = input.terms === undefined ? (status === 'known' ? current.terms : []) : input.terms;
+    const content = normalizeKnowledgeContent(status, understanding, termsInput);
+    if (current.childCount && content.status !== 'known') {
+      fail(409, 'CHILDREN_REQUIRE_KNOWN_PARENT', 'A node with children must remain known.');
+    }
+    if (parentId !== null) {
+      if (parentId === id) fail(400, 'KNOWLEDGE_CYCLE', 'A node cannot be its own parent.');
+      const parent = this.getKnowledgeNode(parentId);
+      if (parent.status !== 'known') fail(409, 'PARENT_NOT_KNOWN', 'Only a known node may be decomposed into children.');
+      if (this.#knowledgeIsDescendant(parentId, id)) fail(400, 'KNOWLEDGE_CYCLE', 'A node cannot be moved beneath one of its descendants.');
+      if (input.branch !== undefined && branch !== parent.branch) fail(400, 'BRANCH_MISMATCH', 'A child must belong to the same branch as its parent.');
+      branch = parent.branch;
+    }
+    this.#assertUniqueKnowledgeSibling(name, branch, parentId, id);
+    const unchanged = name === current.name && branch === current.branch && parentId === current.parentId &&
+      content.status === current.status && content.understanding === current.understanding &&
+      canonicalJson(content.terms) === canonicalJson(current.terms);
+    if (unchanged) return current;
+    const timestamp = now();
+    transaction(this.#db, () => {
+      const revision = current.revision + 1;
+      this.#db.prepare(`UPDATE knowledge_nodes SET branch = ?, parent_id = ?, status = ?, revision = ?, updated_at = ?, payload = ? WHERE id = ?`)
+        .run(branch, parentId, content.status, revision, timestamp,
+          this.#encryptKnowledgeNode(id, revision, branch, { name, understanding: content.understanding, terms: content.terms }), id);
+      if (branch !== current.branch) this.#moveKnowledgeDescendants(id, branch, timestamp);
+      const parents = new Set();
+      if (current.parentId !== null && (name !== current.name || content.status !== current.status || parentId !== current.parentId)) parents.add(current.parentId);
+      if (parentId !== null && parentId !== current.parentId) parents.add(parentId);
+      for (const affected of parents) this.#touchKnowledgeNode(affected, timestamp);
+    });
+    return this.getKnowledgeNode(id);
+  }
+
+  deleteKnowledgeNode(value) {
+    this.#requireUnlocked();
+    const id = knowledgeId(value);
+    const node = this.getKnowledgeNode(id);
+    if (node.childCount) fail(409, 'NODE_HAS_CHILDREN', "Move or delete this node's children before deleting it.");
+    transaction(this.#db, () => {
+      this.#db.prepare('DELETE FROM knowledge_nodes WHERE id = ?').run(id);
+      if (node.parentId !== null) this.#touchKnowledgeNode(node.parentId, now());
+    });
+    return { deleted: true };
+  }
+
+  createKnowledgeConnection(input) {
+    this.#requireUnlocked();
+    requireObject(input);
+    const first = knowledgeId(input.sourceId, 'sourceId');
+    const second = knowledgeId(input.targetId, 'targetId');
+    if (first === second) fail(400, 'SELF_CONNECTION', 'A node cannot connect to itself.');
+    this.#knowledgeNodeRow(first); this.#knowledgeNodeRow(second);
+    const [sourceId, targetId] = first < second ? [first, second] : [second, first];
+    if (this.#db.prepare('SELECT 1 FROM knowledge_connections WHERE source_id = ? AND target_id = ?').get(sourceId, targetId)) {
+      fail(409, 'KNOWLEDGE_CONNECTION_EXISTS', 'These nodes are already connected.');
+    }
+    const createdAt = now();
+    const result = this.#db.prepare('INSERT INTO knowledge_connections(source_id, target_id, created_at) VALUES (?, ?, ?)')
+      .run(sourceId, targetId, createdAt);
+    return { id: Number(result.lastInsertRowid), sourceId, targetId };
+  }
+
+  deleteKnowledgeConnection(value) {
+    this.#requireUnlocked();
+    const id = knowledgeId(value);
+    const result = this.#db.prepare('DELETE FROM knowledge_connections WHERE id = ?').run(id);
+    if (!result.changes) fail(404, 'KNOWLEDGE_CONNECTION_NOT_FOUND', `Connection ${id} does not exist.`);
+    return { deleted: true };
+  }
+
+  getAgentKeyStatus() {
+    this.#requireUnlocked();
+    const stored = this.#meta(AGENT_KEY);
+    return stored ? { configured: true, prefix: stored.prefix, createdAt: stored.createdAt }
+      : { configured: false, prefix: null, createdAt: null };
+  }
+
+  generateAgentKey() {
+    this.#requireUnlocked();
+    const token = `atlas_${randomBytes(32).toString('base64url')}`;
+    const createdAt = now();
+    const prefix = token.slice(0, 14);
+    this.#setMeta(AGENT_KEY, { verifier: this.#agentKeyVerifier(token), prefix, createdAt });
+    return { configured: true, prefix, createdAt, key: token };
+  }
+
+  revokeAgentKey() {
+    this.#requireUnlocked();
+    this.#db.prepare('DELETE FROM metadata WHERE key = ?').run(AGENT_KEY);
+    return { revoked: true };
+  }
+
+  verifyAgentKey(token) {
+    const stored = this.#meta(AGENT_KEY);
+    if (!stored || typeof token !== 'string' || !/^atlas_[A-Za-z0-9_-]{43}$/.test(token)) return false;
+    const expected = Buffer.from(stored.verifier ?? '', 'hex');
+    const actual = Buffer.from(this.#agentKeyVerifier(token), 'hex');
+    return expected.length === actual.length && expected.length === 32 && timingSafeEqual(expected, actual);
+  }
+
+  getAgentPersonalInfo() {
+    this.#requireUnlocked();
+    const record = this.listRecords({ category: 'person' })[0];
+    if (!record) return { personal_info: null };
+    const data = record.data ?? {};
+    return { personal_info: {
+      name: record.title,
+      preferred_name: data.preferredName ?? null,
+      gender: data.gender ?? null,
+      birth_date: data.birthDate ?? null,
+      birth_place: data.birthPlace ?? null,
+      nationalities: data.nationalities ?? [],
+      languages: data.languages ?? [],
+      marital_status: data.maritalStatus ?? null,
+      emails: data.emails ?? [],
+      phone_numbers: data.phoneNumbers ?? [],
+      address: data.address ?? null,
+      summary: data.summary ?? null,
+      notes: data.notes ?? null,
+    } };
+  }
+
+  listAgentExperiences() {
+    this.#requireUnlocked();
+    const experiences = this.listRecords({ category: 'experience' })
+      .sort((left, right) => String(right.data?.startDate ?? '').localeCompare(String(left.data?.startDate ?? '')) ||
+        right.createdAt.localeCompare(left.createdAt))
+      .map((record) => ({ title: record.title, time: {
+        start_date: record.data?.startDate ?? null,
+        end_date: record.data?.endDate || null,
+        ongoing: record.data?.ongoing ?? null,
+      }, description: record.data?.narrative ?? null }));
+    return { experiences };
+  }
+
+  getAgentGoals() {
+    this.#requireUnlocked();
+    const records = this.listRecords({ category: 'goal' });
+    const byParent = new Map();
+    for (const goal of records) {
+      const children = byParent.get(goal.parentId) ?? [];
+      children.push(goal); byParent.set(goal.parentId, children);
+    }
+    for (const children of byParent.values()) children.sort((left, right) => left.position - right.position);
+    const build = (goal) => ({ id: goal.id, title: goal.title,
+      description: goal.data?.description ?? null, importance: goal.data?.importance ?? 'medium',
+      target_date: goal.data?.targetDate || null, subgoals: (byParent.get(goal.id) ?? []).map(build) });
+    const progressions = records.filter((goal) => (byParent.get(goal.id) ?? []).length).map((parent) => {
+      const children = byParent.get(parent.id);
+      const ids = new Set(children.map((child) => child.id));
+      const edges = this.#db.prepare(`SELECT goal_id, prerequisite_id FROM goal_dependencies
+        WHERE goal_id IN (SELECT id FROM records WHERE parent_id = ? AND trashed = 0)
+        ORDER BY created_at, goal_id, prerequisite_id`).all(parent.id)
+        .filter((edge) => ids.has(edge.prerequisite_id))
+        .map((edge) => ({ prerequisite_goal_id: edge.prerequisite_id, dependent_goal_id: edge.goal_id }));
+      return { parent_goal_id: parent.id, subgoal_ids: children.map((child) => child.id), edges };
+    });
+    return { goals: (byParent.get(null) ?? []).map(build), progressions };
+  }
+
+  listAgentProjects() {
+    this.#requireUnlocked();
+    const projects = this.listRecords({ category: 'project' }).map((record) => ({
+      title: record.title, description: record.data?.context ?? null, github_link: record.data?.githubLink || null,
+    })).sort((left, right) => left.title.localeCompare(right.title, 'en-US', { sensitivity: 'base' }));
+    return { projects };
   }
 
   createRecord(input) {
@@ -695,7 +950,12 @@ export class Atlas {
   #replaceSnapshot(prepared, images) {
     this.#requireUnlocked();
     transaction(this.#db, () => {
-      this.#db.exec('DELETE FROM record_images; DELETE FROM goal_dependencies; DELETE FROM links; DELETE FROM record_revisions; DELETE FROM records; DELETE FROM custom_fields;');
+      this.#db.exec('DELETE FROM record_images; DELETE FROM goal_dependencies; DELETE FROM links; DELETE FROM record_revisions; DELETE FROM records; DELETE FROM custom_fields; DELETE FROM knowledge_connections; DELETE FROM knowledge_metadata;');
+      const deleteKnowledgeLeaves = this.#db.prepare(`DELETE FROM knowledge_nodes
+        WHERE NOT EXISTS (SELECT 1 FROM knowledge_nodes child WHERE child.parent_id = knowledge_nodes.id)`);
+      while (this.#db.prepare('SELECT 1 FROM knowledge_nodes LIMIT 1').get()) {
+        if (!deleteKnowledgeLeaves.run().changes) fail(500, 'KNOWLEDGE_INTEGRITY_ERROR', 'Stored knowledge hierarchy could not be replaced.');
+      }
       for (const field of prepared.customFields) {
         this.#db.prepare(`INSERT INTO custom_fields(id, category, type, created_at, updated_at, payload, archived)
           VALUES (?, ?, ?, ?, ?, ?, ?)`).run(field.id, field.category, field.type, field.createdAt, field.updatedAt,
@@ -722,6 +982,18 @@ export class Atlas {
         this.#db.prepare('INSERT INTO goal_dependencies(goal_id, prerequisite_id, created_at) VALUES (?, ?, ?)')
           .run(edge.goalId, edge.prerequisiteId, edge.createdAt);
       }
+      for (const node of prepared.knowledge.nodes) {
+        this.#db.prepare(`INSERT INTO knowledge_nodes
+          (id, branch, parent_id, status, revision, created_at, updated_at, payload)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).run(node.id, node.branch, node.parentId, node.status,
+          node.revision, node.createdAt, node.updatedAt,
+          this.#encryptKnowledgeNode(node.id, node.revision, node.branch, node));
+      }
+      for (const connection of prepared.knowledge.connections) {
+        this.#db.prepare(`INSERT INTO knowledge_connections(id, source_id, target_id, created_at) VALUES (?, ?, ?, ?)`)
+          .run(connection.id, connection.sourceId, connection.targetId, connection.createdAt);
+      }
+      for (const entry of prepared.knowledge.metadata) this.#setKnowledgeMeta(entry.key, entry.value);
       for (const image of images) {
         const content = readFileSync(image.path);
         try {
@@ -753,6 +1025,15 @@ export class Atlas {
       links: this.#db.prepare('SELECT * FROM links ORDER BY created_at, id').all().map((row) => this.#linkFromRow(row)),
       goalDependencies: this.#db.prepare('SELECT goal_id, prerequisite_id, created_at FROM goal_dependencies ORDER BY created_at, goal_id, prerequisite_id')
         .all().map((edge) => ({ goalId: edge.goal_id, prerequisiteId: edge.prerequisite_id, createdAt: edge.created_at })),
+      knowledge: {
+        nodes: this.#db.prepare('SELECT * FROM knowledge_nodes ORDER BY id').all().map((row) => this.#knowledgeNodeFromRow(row)),
+        connections: this.#db.prepare('SELECT * FROM knowledge_connections ORDER BY id').all().map((row) => ({
+          id: row.id, sourceId: row.source_id, targetId: row.target_id, createdAt: row.created_at,
+        })),
+        metadata: this.#db.prepare('SELECT * FROM knowledge_metadata ORDER BY key').all().map((row) => ({
+          key: row.key, value: this.#knowledgeMeta(row.key, row.payload),
+        })),
+      },
     };
   }
 
@@ -1111,6 +1392,7 @@ export class Atlas {
       visited.add(goalId);
     };
     for (const edge of goalDependencies) visitDependency(edge.prerequisiteId);
+    const knowledge = validateKnowledgeSnapshot(snapshot.knowledge, { fallbackTimestamp: snapshot.exportedAt ?? now() });
     const depths = new Map();
     for (const record of records) {
       const path = [];
@@ -1127,7 +1409,7 @@ export class Atlas {
       }
     }
     records.sort((left, right) => depths.get(left.id) - depths.get(right.id));
-    return { records, revisions, customFields, links, goalDependencies };
+    return { records, revisions, customFields, links, goalDependencies, knowledge };
   }
 
   #changeTrash(existing, trashed) {
@@ -1167,7 +1449,7 @@ export class Atlas {
     }
   }
 
-  #migrateGoalTextFields() {
+  #migrateGoalData() {
     transaction(this.#db, () => {
       for (const row of this.#db.prepare("SELECT * FROM records WHERE category = 'goal'").all()) {
         const value = decryptJson(this.#key, row.payload, objectAad('record', row.id, row.revision, row.category));
@@ -1337,6 +1619,94 @@ export class Atlas {
     const column = outgoing ? 'source_id' : 'target_id';
     return this.#db.prepare(`SELECT * FROM links WHERE ${column} = ? ORDER BY created_at`).all(id)
       .map((row) => this.#linkFromRow(row));
+  }
+
+  #seedKnowledge() {
+    if (this.#db.prepare('SELECT 1 FROM knowledge_metadata WHERE key = ?').get(KNOWLEDGE_SEED_KEY)) return false;
+    const snapshot = createInitialKnowledgeSnapshot(now());
+    transaction(this.#db, () => {
+      for (const node of snapshot.nodes) {
+        this.#db.prepare(`INSERT INTO knowledge_nodes
+          (id, branch, parent_id, status, revision, created_at, updated_at, payload)
+          VALUES (?, ?, NULL, ?, ?, ?, ?, ?)`).run(node.id, node.branch, node.status, node.revision,
+          node.createdAt, node.updatedAt, this.#encryptKnowledgeNode(node.id, node.revision, node.branch, node));
+      }
+      for (const entry of snapshot.metadata) this.#setKnowledgeMeta(entry.key, entry.value);
+    });
+    return true;
+  }
+
+  #knowledgeNodeRow(id) {
+    const row = this.#db.prepare('SELECT * FROM knowledge_nodes WHERE id = ?').get(id);
+    if (!row) fail(404, 'KNOWLEDGE_NODE_NOT_FOUND', `Node ${id} does not exist.`);
+    return row;
+  }
+
+  #encryptKnowledgeNode(id, revision, branch, value) {
+    return encryptJson(this.#key, { name: value.name, understanding: value.understanding, terms: value.terms },
+      objectAad('knowledge-node', String(id), revision, branch));
+  }
+
+  #knowledgeNodeFromRow(row) {
+    const value = decryptJson(this.#key, row.payload,
+      objectAad('knowledge-node', String(row.id), row.revision, row.branch));
+    return { id: row.id, name: value.name, branch: row.branch, parentId: row.parent_id,
+      status: row.status, understanding: value.understanding ?? null, terms: value.terms ?? [],
+      revision: row.revision, createdAt: row.created_at, updatedAt: row.updated_at };
+  }
+
+  #assertUniqueKnowledgeSibling(name, branch, parentId, excludeId = undefined) {
+    const key = name.normalize('NFKC').toLocaleLowerCase('en-US');
+    const rows = this.#db.prepare(`SELECT * FROM knowledge_nodes
+      WHERE branch = ? AND ((parent_id = ?) OR (parent_id IS NULL AND ? IS NULL))`).all(branch, parentId, parentId);
+    if (rows.some((row) => row.id !== excludeId &&
+      this.#knowledgeNodeFromRow(row).name.normalize('NFKC').toLocaleLowerCase('en-US') === key)) {
+      fail(409, 'KNOWLEDGE_NODE_EXISTS', 'A node with this name already exists under that parent.');
+    }
+  }
+
+  #touchKnowledgeNode(id, timestamp) {
+    const row = this.#knowledgeNodeRow(id);
+    const value = this.#knowledgeNodeFromRow(row);
+    const revision = row.revision + 1;
+    this.#db.prepare('UPDATE knowledge_nodes SET revision = ?, updated_at = ?, payload = ? WHERE id = ?')
+      .run(revision, timestamp,
+        this.#encryptKnowledgeNode(id, revision, row.branch, value), id);
+  }
+
+  #knowledgeIsDescendant(candidateId, ancestorId) {
+    const result = this.#db.prepare(`WITH RECURSIVE descendants(id) AS (
+      SELECT id FROM knowledge_nodes WHERE parent_id = ?
+      UNION ALL SELECT node.id FROM knowledge_nodes node JOIN descendants item ON node.parent_id = item.id
+    ) SELECT 1 AS found FROM descendants WHERE id = ? LIMIT 1`).get(ancestorId, candidateId);
+    return Boolean(result);
+  }
+
+  #moveKnowledgeDescendants(id, branch, timestamp) {
+    const rows = this.#db.prepare(`WITH RECURSIVE descendants(id) AS (
+      SELECT id FROM knowledge_nodes WHERE parent_id = ?
+      UNION ALL SELECT node.id FROM knowledge_nodes node JOIN descendants item ON node.parent_id = item.id
+    ) SELECT knowledge_nodes.* FROM knowledge_nodes JOIN descendants USING(id)`).all(id);
+    for (const row of rows) {
+      const value = this.#knowledgeNodeFromRow(row);
+      const revision = row.revision + 1;
+      this.#db.prepare('UPDATE knowledge_nodes SET branch = ?, revision = ?, updated_at = ?, payload = ? WHERE id = ?')
+        .run(branch, revision, timestamp, this.#encryptKnowledgeNode(row.id, revision, branch, value), row.id);
+    }
+  }
+
+  #knowledgeMeta(key, payload) {
+    return decryptJson(this.#key, payload, objectAad('knowledge-metadata', key, 1, 'knowledge')).value;
+  }
+
+  #setKnowledgeMeta(key, value) {
+    this.#db.prepare(`INSERT INTO knowledge_metadata(key, payload) VALUES (?, ?)
+      ON CONFLICT(key) DO UPDATE SET payload = excluded.payload`).run(key,
+      encryptJson(this.#key, { value }, objectAad('knowledge-metadata', key, 1, 'knowledge')));
+  }
+
+  #agentKeyVerifier(token) {
+    return createHash('sha256').update(token, 'utf8').digest('hex');
   }
 
   #meta(key) {

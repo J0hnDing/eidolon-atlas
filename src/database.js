@@ -97,6 +97,38 @@ const MIGRATIONS = [
       CREATE INDEX goal_dependencies_prerequisite ON goal_dependencies(prerequisite_id);
     `,
   },
+  {
+    version: 6,
+    sql: `
+      CREATE TABLE knowledge_nodes (
+        id INTEGER PRIMARY KEY,
+        branch TEXT NOT NULL CHECK (branch IN ('subjects', 'ideologies')),
+        parent_id INTEGER REFERENCES knowledge_nodes(id) ON DELETE RESTRICT,
+        status TEXT NOT NULL CHECK (status IN ('unassessed', 'unknown', 'known')),
+        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX knowledge_nodes_parent ON knowledge_nodes(parent_id);
+      CREATE INDEX knowledge_nodes_branch_status ON knowledge_nodes(branch, status);
+
+      CREATE TABLE knowledge_connections (
+        id INTEGER PRIMARY KEY,
+        source_id INTEGER NOT NULL REFERENCES knowledge_nodes(id) ON DELETE CASCADE,
+        target_id INTEGER NOT NULL REFERENCES knowledge_nodes(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        CHECK (source_id < target_id),
+        UNIQUE (source_id, target_id)
+      ) STRICT;
+      CREATE INDEX knowledge_connections_target ON knowledge_connections(target_id);
+
+      CREATE TABLE knowledge_metadata (
+        key TEXT PRIMARY KEY,
+        payload TEXT NOT NULL
+      ) STRICT;
+    `,
+  },
 ];
 
 export function openDatabase(path = 'data/atlas.sqlite') {

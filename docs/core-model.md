@@ -27,7 +27,8 @@ may also carry encrypted JPEG, PNG, or WebP images, up to 20 MiB per image and
 ### Goal
 
 A Goal has a short-, middle-, or long-term horizon, an optional target date,
-and a description. Top-level goal creation does not ask for progress; subgoals
+and a description. Every goal and subgoal has an importance of `low`, `medium`,
+or `high`; existing and new records default to `medium`. Top-level goal creation does not ask for progress; subgoals
 start at a user-selected progress value that defaults to zero. Parent progress
 rolls up from subgoals, and subgoal ownership and order are assigned by the
 progression that creates them.
@@ -38,6 +39,17 @@ goal. A goal has at most one parent; hierarchy and prerequisite cycles are
 invalid; sibling order is explicit. Each leaf goal stores progress from 0 to
 100, while parent progress rolls up evenly from its active direct subgoals.
 This progression is separate from ordinary cross-record links.
+
+### Knowledge
+
+Knowledge is the Epistome-style taxonomy workspace. Nodes belong to a branch,
+have one canonical parent, a status, and revision timestamps. Names,
+explanations, and terms are encrypted payload; branch, parentage, status,
+revision, timestamps, and connection topology are structural metadata. Sibling
+names are case-insensitively unique, parents must be known, cycles are
+rejected, and only leaf nodes may be deleted. Connections are undirected.
+Knowledge is included in encrypted Atlas backups and is available at
+`/knowledge` in the browser.
 
 ### Project
 

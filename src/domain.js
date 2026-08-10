@@ -12,11 +12,13 @@ export const RELATIONSHIP_KINDS = Object.freeze([
 export const PROJECT_STATUSES = Object.freeze([
   'planned', 'active', 'paused', 'completed', 'abandoned',
 ]);
+export const GOAL_IMPORTANCES = Object.freeze(['low', 'medium', 'high']);
 
 const CATEGORY_SET = new Set(CATEGORIES);
 const FIELD_TYPE_SET = new Set(CUSTOM_FIELD_TYPES);
 const RELATIONSHIP_KIND_SET = new Set(RELATIONSHIP_KINDS);
 const PROJECT_STATUS_SET = new Set(PROJECT_STATUSES);
+const GOAL_IMPORTANCE_SET = new Set(GOAL_IMPORTANCES);
 const PARTIAL_DATE = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/;
 const PERSON_STRING_FIELDS = Object.freeze([
   'preferredName', 'gender', 'birthPlace', 'maritalStatus', 'address', 'summary', 'notes',
@@ -133,6 +135,9 @@ function validateCategoryData(category, data) {
     if (data.description !== undefined && typeof data.description !== 'string') {
       fail(400, 'VALIDATION_ERROR', 'Goal description must be a string.');
     }
+    if (!GOAL_IMPORTANCE_SET.has(data.importance)) {
+      fail(400, 'VALIDATION_ERROR', `Goal importance must be one of: ${GOAL_IMPORTANCES.join(', ')}.`);
+    }
     if (data.progress !== undefined && (!Number.isInteger(data.progress) || data.progress < 0 || data.progress > 100)) {
       fail(400, 'VALIDATION_ERROR', 'Goal progress must be a whole number from 0 to 100.');
     }
@@ -176,8 +181,9 @@ export function normalizeRecord(input, existing = undefined) {
   }
   const title = input.title === undefined ? existing?.title : requireString(input.title, 'title');
   if (title === undefined) fail(400, 'VALIDATION_ERROR', 'title is required.');
-  const data = input.data === undefined ? existing?.data : jsonClone(requireObject(input.data, 'data'), 'data');
+  let data = input.data === undefined ? existing?.data : jsonClone(requireObject(input.data, 'data'), 'data');
   if (data === undefined) fail(400, 'VALIDATION_ERROR', 'data is required.');
+  if (category === 'goal' && data.importance === undefined) data = { ...data, importance: 'medium' };
   const customFieldValues = input.customFieldValues === undefined
     ? (existing?.customFieldValues ?? {})
     : jsonClone(requireObject(input.customFieldValues, 'customFieldValues'), 'customFieldValues');

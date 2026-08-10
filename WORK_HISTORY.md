@@ -88,3 +88,29 @@ Simplified top-level Goal creation to title, horizon, target date, and descripti
 ### Limitations
 
 none
+
+## 2026-08-10 02:24 — Integrate encrypted Knowledge workspace
+
+- Category: feature
+- Area: Knowledge
+
+### Summary
+
+Added Epistome-compatible Knowledge taxonomy, encrypted storage, hierarchy and connection invariants, backup compatibility, Atlas-native routes and CRUD UI, documentation, and regression coverage as the eighth workspace.
+
+### Limitations
+
+Automated browser visual QA could not run because the in-app browser connector failed during initialization; syntax, unit/integration tests, and isolated live HTTP/deep-link checks passed.
+
+## 2026-08-10 02:24 — Add stateless permission-controlled agent API
+
+- Category: feature
+- Area: agent integration
+
+### Summary
+
+Implemented the minimal stateless read-only agent API with verifier-only rotating keys, authenticated discovery/guide/OpenAPI resources, exact allowlisted Person, Experience, Goal, and Project projections, locked-runtime enforcement, UI key management, documentation, and automated/live HTTP coverage.
+
+### Limitations
+
+Automated browser visual QA could not run because the in-app browser connector failed during initialization; syntax, unit/integration tests, and isolated live HTTP/deep-link checks passed.

@@ -35,8 +35,10 @@ test('category contracts and person singleton are enforced', async (t) => {
   assert.throws(() => create(atlas, 'experience', 'Bad ongoing', { kind: 'period', startDate: '2026', endDate: '2026-02', ongoing: true }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'goal', 'Bad goal', { horizon: 'someday' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'goal', 'Goal with status', { horizon: 'short', status: 'active' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'goal', 'Bad importance', { horizon: 'short', importance: 'urgent' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'goal', 'Legacy goal text', { horizon: 'short', progressNote: 'old' }), { code: 'VALIDATION_ERROR' });
   assert.equal(create(atlas, 'goal', 'Described goal', { horizon: 'short', description: 'Clear context', progress: 0 }).data.description, 'Clear context');
+  assert.equal(create(atlas, 'goal', 'Default importance', { horizon: 'short' }).data.importance, 'medium');
   assert.throws(() => create(atlas, 'project', 'Old state field', { context: '', status: 'active', githubLink: '', currentState: '' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'project', 'Bad status', { context: '', status: 'in_progress', githubLink: '' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'project', 'Bad link', { context: '', status: 'active', githubLink: 'github.com/example/repo' }), { code: 'VALIDATION_ERROR' });
@@ -64,7 +66,7 @@ test('numbered migrations are idempotent across reopen', async (t) => {
   const first = new Atlas({ databasePath });
   await first.setup(APP_PASSPHRASE);
   assert.deepEqual(first.database.prepare('SELECT version FROM schema_migrations ORDER BY version').all()
-    .map((row) => row.version), [1, 2, 3, 4, 5]);
+    .map((row) => row.version), [1, 2, 3, 4, 5, 6]);
   first.close();
   const reopened = new Atlas({ databasePath });
   assert.deepEqual(reopened.status(), { initialized: true, locked: true });
@@ -124,11 +126,108 @@ test('unlock purges legacy goal text fields into description across current data
   atlas.lock();
   await atlas.unlock(APP_PASSPHRASE);
   assert.deepEqual(atlas.getRecord(goal.id).data, {
-    horizon: 'short', progress: 0, description: 'Why it matters\n\nHalfway there',
+    horizon: 'short', progress: 0, description: 'Why it matters\n\nHalfway there', importance: 'medium',
   });
   assert.deepEqual(atlas.listRevisions(goal.id)[0].data, {
-    horizon: 'short', progress: 0, description: 'Why it matters\n\nHalfway there',
+    horizon: 'short', progress: 0, description: 'Why it matters\n\nHalfway there', importance: 'medium',
   });
+});
+
+test('knowledge is seeded once, encrypted at rest, and preserves hierarchy invariants', async (t) => {
+  const { atlas, databasePath } = await fixture(t);
+  assert.equal(atlas.listKnowledgeNodes().length, 50);
+  const root = atlas.createKnowledgeNode({ name: 'Private sentinel topic', branch: 'subjects',
+    status: 'known', understanding: 'Private sentinel explanation', terms: [] });
+  const child = atlas.createKnowledgeNode({ name: 'Nested topic', branch: 'subjects', parentId: root.id });
+  assert.equal(child.parentId, root.id);
+  assert.throws(() => atlas.createKnowledgeNode({ name: 'nested TOPIC', branch: 'subjects', parentId: root.id }),
+    { code: 'KNOWLEDGE_NODE_EXISTS' });
+  assert.throws(() => atlas.patchKnowledgeNode(root.id, { status: 'unknown' }),
+    { code: 'CHILDREN_REQUIRE_KNOWN_PARENT' });
+  atlas.patchKnowledgeNode(child.id, { status: 'known', understanding: 'Known child' });
+  assert.throws(() => atlas.patchKnowledgeNode(root.id, { parentId: child.id }), { code: 'KNOWLEDGE_CYCLE' });
+  assert.throws(() => atlas.deleteKnowledgeNode(root.id), { code: 'NODE_HAS_CHILDREN' });
+  const connection = atlas.createKnowledgeConnection({ sourceId: root.id, targetId: child.id });
+  assert.equal(atlas.getKnowledgeNode(root.id).connections[0].id, connection.id);
+  atlas.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  const bytes = await readFile(databasePath);
+  assert.equal(bytes.includes(Buffer.from('Private sentinel topic')), false);
+  assert.equal(bytes.includes(Buffer.from('Private sentinel explanation')), false);
+  atlas.lock();
+  await atlas.unlock(APP_PASSPHRASE);
+  assert.equal(atlas.listKnowledgeNodes().length, 52);
+});
+
+test('knowledge round-trips in backups and legacy backups receive the standard taxonomy', async (t) => {
+  const { atlas, directory } = await fixture(t);
+  const root = atlas.createKnowledgeNode({ name: 'Portable knowledge', branch: 'ideologies',
+    status: 'known', understanding: 'Portable explanation', terms: [{ id: 'portable', label: 'Portable', definition: 'Moves safely.' }] });
+  const portable = await atlas.export(BACKUP_PASSPHRASE);
+  const destination = new Atlas({ databasePath: join(directory, 'knowledge-destination.sqlite') });
+  await destination.setup(APP_PASSPHRASE);
+  const replacedParent = destination.createKnowledgeNode({ name: 'Replaced parent', branch: 'subjects',
+    status: 'known', understanding: 'Will be replaced', terms: [] });
+  destination.createKnowledgeNode({ name: 'Replaced child', branch: 'subjects', parentId: replacedParent.id });
+  await destination.import(BACKUP_PASSPHRASE, portable);
+  assert.equal(destination.getKnowledgeNode(root.id).understanding, 'Portable explanation');
+
+  const legacySnapshot = await openBackupEnvelope(BACKUP_PASSPHRASE, portable);
+  const invalidSnapshot = structuredClone(legacySnapshot);
+  invalidSnapshot.knowledge.nodes.find((node) => node.id === root.id).parentId = 999999;
+  await assert.rejects(destination.import(BACKUP_PASSPHRASE,
+    await createBackupEnvelope(BACKUP_PASSPHRASE, invalidSnapshot)), { code: 'INVALID_BACKUP' });
+  assert.equal(destination.getKnowledgeNode(root.id).understanding, 'Portable explanation');
+  delete legacySnapshot.knowledge;
+  const legacyEnvelope = await createBackupEnvelope(BACKUP_PASSPHRASE, legacySnapshot);
+  await destination.import(BACKUP_PASSPHRASE, legacyEnvelope);
+  assert.equal(destination.listKnowledgeNodes().length, 50);
+  destination.close();
+});
+
+test('agent key lifecycle stores only a verifier and read projections expose allowlisted active data', async (t) => {
+  const { atlas, databasePath } = await fixture(t);
+  const generated = atlas.generateAgentKey();
+  assert.match(generated.key, /^atlas_[A-Za-z0-9_-]{43}$/);
+  assert.equal(atlas.verifyAgentKey(generated.key), true);
+  assert.equal(atlas.verifyAgentKey(`${generated.key}x`), false);
+  const stored = atlas.database.prepare("SELECT value FROM metadata WHERE key = 'agent-key'").get().value;
+  assert.equal(stored.includes(generated.key), false);
+  assert.equal(JSON.parse(stored).verifier.length, 64);
+
+  create(atlas, 'person', 'Legal Name', { preferredName: 'Preferred', gender: 'x', birthDate: '2000',
+    birthPlace: 'Place', nationalities: ['One'], languages: ['English'], maritalStatus: '',
+    emails: ['me@example.test'], phoneNumbers: ['123'], address: 'Home', summary: 'Summary', notes: 'Notes',
+    passportNumber: 'SECRET', nationalIdNumber: 'SECRET2' });
+  create(atlas, 'experience', 'Earlier', { kind: 'event', startDate: '2020', narrative: 'Earlier description' });
+  create(atlas, 'experience', 'Later', { kind: 'period', startDate: '2024-02', ongoing: true, narrative: 'Later description' });
+  const root = create(atlas, 'goal', 'Outcome', { horizon: 'long', targetDate: '2030', description: 'Outcome description', progress: 0, importance: 'high' });
+  const first = create(atlas, 'goal', 'First', { horizon: 'short', description: '', progress: 0 }, { parentId: root.id });
+  const second = create(atlas, 'goal', 'Second', { horizon: 'short', description: '', progress: 0, importance: 'low' }, { parentId: root.id });
+  atlas.createGoalDependency(second.id, first.id);
+  create(atlas, 'project', 'Zulu', { context: 'Z project', status: 'active', githubLink: '' });
+  create(atlas, 'project', 'Alpha', { context: 'A project', status: 'planned', githubLink: 'https://github.com/example/a' });
+
+  const personal = atlas.getAgentPersonalInfo().personal_info;
+  assert.equal(personal.name, 'Legal Name');
+  assert.equal(Object.hasOwn(personal, 'passport_number'), false);
+  assert.deepEqual(atlas.listAgentExperiences().experiences.map((item) => item.title), ['Later', 'Earlier']);
+  const goals = atlas.getAgentGoals();
+  assert.equal(goals.goals[0].importance, 'high');
+  assert.equal(goals.goals[0].subgoals[0].importance, 'medium');
+  assert.deepEqual(goals.progressions[0].edges, [{ prerequisite_goal_id: first.id, dependent_goal_id: second.id }]);
+  assert.deepEqual(atlas.listAgentProjects().projects.map((item) => item.title), ['Alpha', 'Zulu']);
+
+  const backup = await atlas.export(BACKUP_PASSPHRASE);
+  const snapshotText = JSON.stringify(await openBackupEnvelope(BACKUP_PASSPHRASE, backup));
+  assert.equal(snapshotText.includes(generated.key), false);
+  assert.equal(snapshotText.includes(JSON.parse(stored).verifier), false);
+  const rotated = atlas.generateAgentKey();
+  assert.equal(atlas.verifyAgentKey(generated.key), false);
+  assert.equal(atlas.verifyAgentKey(rotated.key), true);
+  atlas.revokeAgentKey();
+  assert.equal(atlas.verifyAgentKey(rotated.key), false);
+  atlas.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  assert.equal((await readFile(databasePath)).includes(Buffer.from(generated.key)), false);
 });
 
 test('user content is encrypted and tampering and wrong passphrases fail closed', async (t) => {
