@@ -114,3 +114,16 @@ Implemented the minimal stateless read-only agent API with verifier-only rotatin
 ### Limitations
 
 Automated browser visual QA could not run because the in-app browser connector failed during initialization; syntax, unit/integration tests, and isolated live HTTP/deep-link checks passed.
+
+## 2026-08-10 14:13 — Add authenticated Clear All reset in Settings
+
+- Category: feature
+- Area: settings and data lifecycle
+
+### Summary
+
+Added a Settings danger-zone Clear All flow that requires the current atlas passphrase and irreversible-action acknowledgement. Added POST /api/reset and Atlas.clearAll() to verify credentials, clear staged imports and all user/encryption/agent data transactionally, discard the in-memory key, and return uninitialized locked status. Reset browser state and route to first-time passphrase setup. Documented the security behavior and added direct plus HTTP regression tests, including wrong-passphrase preservation and successful setup with a new passphrase. npm run check passes all 28 tests.
+
+### Limitations
+
+SQLite schema migrations are intentionally preserved so the existing database can be initialized again; no browser automation was run.

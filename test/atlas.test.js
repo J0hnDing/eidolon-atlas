@@ -255,6 +255,38 @@ test('locking removes access to protected operations', async (t) => {
   assert.deepEqual(atlas.status(), { initialized: true, locked: true });
 });
 
+test('clear all verifies the current passphrase and returns Atlas to first-time setup', async (t) => {
+  const { atlas } = await fixture(t);
+  const record = create(atlas, 'preference', 'Keep until authenticated', { value: 'private' });
+  atlas.createCustomField({ category: 'preference', name: 'Private note', type: 'text' });
+  const agent = atlas.generateAgentKey();
+  const staged = await atlas.stageImportUpload([Buffer.from('staged encrypted backup')]);
+
+  await assert.rejects(atlas.clearAll('this is the wrong passphrase'), { code: 'INVALID_PASSPHRASE' });
+  assert.equal(atlas.getRecord(record.id).title, 'Keep until authenticated');
+  assert.equal(atlas.verifyAgentKey(agent.key), true);
+
+  assert.deepEqual(await atlas.clearAll(APP_PASSPHRASE), { initialized: false, locked: true });
+  const clearedTables = [
+    'metadata', 'records', 'record_revisions', 'custom_fields', 'links', 'record_images',
+    'goal_dependencies', 'knowledge_nodes', 'knowledge_connections', 'knowledge_metadata',
+  ];
+  for (const table of clearedTables) {
+    assert.equal(atlas.database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0, table);
+  }
+  assert.equal(atlas.database.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get().count, 6);
+  await assert.rejects(atlas.unlock(APP_PASSPHRASE), { code: 'NOT_INITIALIZED' });
+
+  const newPassphrase = 'a completely new atlas passphrase';
+  assert.deepEqual(await atlas.setup(newPassphrase), { initialized: true, locked: false });
+  await assert.rejects(atlas.cancelImportUpload(staged.uploadId), { code: 'IMPORT_UPLOAD_NOT_FOUND' });
+  assert.deepEqual(atlas.listRecords(), []);
+  assert.equal(atlas.listKnowledgeNodes().length, 50);
+  atlas.lock();
+  await assert.rejects(atlas.unlock(APP_PASSPHRASE), { code: 'INVALID_PASSPHRASE' });
+  await atlas.unlock(newPassphrase);
+});
+
 test('goal sibling order, moves, cycle rejection, and conservative trash remain coherent', async (t) => {
   const { atlas } = await fixture(t);
   const first = create(atlas, 'goal', 'First', { horizon: 'short' });
@@ -547,6 +579,43 @@ function rawRequest(port, { method = 'GET', path = '/', headers = {}, chunks = [
     req.end();
   });
 }
+
+test('HTTP reset requires the current passphrase and supports clean setup afterward', async (t) => {
+  const { atlas, directory } = await fixture(t);
+  const publicDir = join(directory, 'public');
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(publicDir);
+  await writeFile(join(publicDir, 'index.html'), '<!doctype html><title>Atlas</title>');
+  create(atlas, 'preference', 'Server-side reset sentinel', { value: true });
+  const server = createServer({ atlas, publicDir });
+  const address = await listen(server, { port: 0 });
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
+  const port = address.port;
+
+  const wrong = await rawRequest(port, {
+    method: 'POST', path: '/api/reset', headers: { 'content-type': 'application/json' },
+    chunks: [Buffer.from(JSON.stringify({ passphrase: 'this is the wrong passphrase' }))],
+  });
+  assert.equal(wrong.status, 401);
+  assert.equal(JSON.parse(wrong.body).error.code, 'INVALID_PASSPHRASE');
+  assert.equal(JSON.parse((await rawRequest(port, { path: '/api/records' })).body).length, 1);
+
+  const cleared = await rawRequest(port, {
+    method: 'POST', path: '/api/reset', headers: { 'content-type': 'application/json' },
+    chunks: [Buffer.from(JSON.stringify({ passphrase: APP_PASSPHRASE }))],
+  });
+  assert.equal(cleared.status, 200);
+  assert.deepEqual(JSON.parse(cleared.body), { initialized: false, locked: true });
+  assert.deepEqual(JSON.parse((await rawRequest(port, { path: '/api/status' })).body), { initialized: false, locked: true });
+
+  const newPassphrase = 'new passphrase after HTTP reset';
+  const setup = await rawRequest(port, {
+    method: 'POST', path: '/api/setup', headers: { 'content-type': 'application/json' },
+    chunks: [Buffer.from(JSON.stringify({ passphrase: newPassphrase }))],
+  });
+  assert.equal(setup.status, 201);
+  assert.deepEqual(JSON.parse((await rawRequest(port, { path: '/api/records' })).body), []);
+});
 
 test('HTTP image and streamed backup endpoints preserve binary contracts', async (t) => {
   const { atlas, directory } = await fixture(t);

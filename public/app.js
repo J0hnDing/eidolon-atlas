@@ -7,7 +7,7 @@ const CATEGORIES = {
   project: { label: "Project", plural: "Projects", icon: "layers", accent: "#6c6f85", eyebrow: "Work in motion", description: "A clear inventory of what you are making and its present state." },
   resource: { label: "Resource", plural: "Resources", icon: "bookmark", accent: "#8b704c", eyebrow: "Assets & capacity", description: "Wealth, capital, assets, accounts, capabilities, and other resources you can draw on." },
   relationship: { label: "Relationship", plural: "Relationships", icon: "link", accent: "#8b5f6a", eyebrow: "People & organizations", description: "The connections that shape your personal and professional world." },
-  preference: { label: "Preference", plural: "Preferences", icon: "sliders", accent: "#5d7774", eyebrow: "Taste & defaults", description: "Choices, boundaries, and defaults you want to remember." }
+  preference: { label: "Preference", plural: "Preferences", icon: "preference", accent: "#5d7774", eyebrow: "Taste & defaults", description: "Choices, boundaries, and defaults you want to remember." }
 };
 
 const RELATIONSHIP_KINDS = [
@@ -119,6 +119,7 @@ const ICONS = {
   menu: ["M4 7h16M4 12h16M4 17h16"],
   person: ["M20 21a8 8 0 0 0-16 0", "M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z"],
   plus: ["M12 5v14M5 12h14"],
+  preference: ["M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.6l-1-1a5.5 5.5 0 0 0-7.8 7.8l1 1L12 21l7.8-7.6 1-1a5.5 5.5 0 0 0 0-7.8Z"],
   restore: ["M3 12a9 9 0 1 0 3-6.7L3 8", "M3 3v5h5"],
   search: ["m21 21-4.35-4.35", "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z"],
   shield: ["M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10Z", "m9 12 2 2 4-5"],
@@ -2058,6 +2059,18 @@ function renderSettings(keyStatus, reference) {
     ])
   ]));
 
+  maintenance.append(element("article", { class: "settings-card settings-danger-card" }, [
+    element("div", { class: "settings-card-icon" }, icon("shield")),
+    element("div", { class: "settings-card-copy" }, [
+      element("p", { class: "eyebrow", text: "Danger zone" }),
+      element("h2", { text: "Clear all" }),
+      element("p", { text: "Permanently delete all atlas data and passphrase credentials, then return to first-time setup." })
+    ]),
+    element("div", { class: "settings-card-action" }, [
+      element("button", { class: "button button-secondary danger-button", type: "button", text: "Clear all data", onclick: openClearAllDialog })
+    ])
+  ]));
+
   const agentCard = element("article", { id: "agent-access-panel", class: "settings-card settings-agent-card" }, [
     element("div", { class: "settings-card-icon" }, icon("key")),
     element("div", { class: "settings-card-copy" }, [
@@ -2229,7 +2242,43 @@ async function lockAtlas() {
   lockLocally();
 }
 
+function openClearAllDialog() {
+  const form = $("#clear-all-form");
+  form.reset();
+  $("#clear-all-dialog").showModal();
+  window.setTimeout(() => form.elements.passphrase.focus(), 30);
+}
+
+async function clearAllAtlas(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  if (!form.reportValidity()) return;
+  const button = $("#confirm-clear-all");
+  setButtonBusy(button, true, "Clearingâ€¦");
+  try {
+    await api("/reset", { method: "POST", body: { passphrase: form.elements.passphrase.value } });
+    $("#clear-all-dialog").close();
+    form.reset();
+    resetLocalAtlasState();
+    window.history.replaceState({}, "", "/");
+    $("#setup-form").reset();
+    showAuth("setup");
+    notify("All atlas data was permanently deleted.", "success");
+  } catch (error) {
+    notify(error.message, "error");
+    form.elements.passphrase.select();
+  } finally {
+    setButtonBusy(button, false);
+  }
+}
+
 function lockLocally() {
+  resetLocalAtlasState();
+  $("#unlock-form").reset();
+  showAuth("unlock");
+}
+
+function resetLocalAtlasState() {
   closeDetail({ navigate: false });
   state.records = [];
   state.allRecords = [];
@@ -2240,8 +2289,7 @@ function lockLocally() {
   state.knowledge.nodes = [];
   state.knowledge.selected = null;
   clearAgentKeySecret();
-  $("#unlock-form").reset();
-  showAuth("unlock");
+  $$('[data-count]').forEach((node) => { node.textContent = "0"; });
 }
 
 function openSidebar() {
@@ -2275,6 +2323,7 @@ function wireEvents() {
   $("#new-record").addEventListener("click", openPrimaryCreate);
   $("#new-record-top").addEventListener("click", openPrimaryCreate);
   $("#record-form").addEventListener("submit", saveRecord);
+  $("#clear-all-form").addEventListener("submit", clearAllAtlas);
   $("#close-detail").addEventListener("click", closeDetail);
   $("#detail-edit").addEventListener("click", () => state.selected && openRecordDialog(state.selected));
   $("#detail-remove").addEventListener("click", removeOrRestore);

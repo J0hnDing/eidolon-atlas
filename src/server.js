@@ -316,6 +316,10 @@ async function routeApi(atlas, request, response, url, limits) {
     await readJson(request, limits.body);
     return sendJson(response, 200, atlas.lock());
   }
+  if (method === 'POST' && path === '/api/reset') {
+    const body = requirePassphraseBody(await readJson(request, limits.body));
+    return sendJson(response, 200, await atlas.clearAll(body.passphrase));
+  }
   if (method === 'GET' && path === '/api/records') {
     return sendJson(response, 200, atlas.listRecords({
       category: url.searchParams.get('category') ?? undefined,

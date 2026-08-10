@@ -43,6 +43,11 @@ the data is unrecoverable. If the application is unlocked, another process
 with control of the same account may be able to access the local service or
 application memory.
 
+The Settings Clear All action requires the current atlas passphrase. After it
+is verified, Atlas permanently removes all user content, staged imports, agent
+credentials, and encryption metadata, discards the in-memory key, and returns
+to first-time passphrase setup. A failed passphrase check does not delete data.
+
 ## Agent API keys
 
 The optional agent API uses one local, rotatable key. Atlas stores only a

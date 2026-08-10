@@ -153,6 +153,36 @@ export class Atlas {
     return this.status();
   }
 
+  async clearAll(passphrase) {
+    this.#requireUnlocked();
+    await this.unlock(passphrase);
+
+    rmSync(this.#stagingDir, { recursive: true, force: true });
+    mkdirSync(this.#stagingDir, { recursive: true });
+    this.#uploads.clear();
+
+    transaction(this.#db, () => {
+      this.#db.exec(`
+        DELETE FROM record_images;
+        DELETE FROM goal_dependencies;
+        DELETE FROM links;
+        DELETE FROM record_revisions;
+        DELETE FROM records;
+        DELETE FROM custom_fields;
+        DELETE FROM knowledge_connections;
+        DELETE FROM knowledge_metadata;
+      `);
+      const deleteKnowledgeLeaves = this.#db.prepare(`DELETE FROM knowledge_nodes
+        WHERE NOT EXISTS (SELECT 1 FROM knowledge_nodes child WHERE child.parent_id = knowledge_nodes.id)`);
+      while (this.#db.prepare('SELECT 1 FROM knowledge_nodes LIMIT 1').get()) {
+        if (!deleteKnowledgeLeaves.run().changes) fail(500, 'KNOWLEDGE_INTEGRITY_ERROR', 'Stored knowledge hierarchy could not be cleared.');
+      }
+      this.#db.exec('DELETE FROM metadata;');
+    });
+
+    return this.lock();
+  }
+
   listKnowledgeNodes() {
     this.#requireUnlocked();
     return this.#db.prepare('SELECT * FROM knowledge_nodes').all()

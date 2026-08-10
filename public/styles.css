@@ -518,6 +518,10 @@ button, input, textarea, select { outline: none; }
 .settings-card { display: grid; min-width: 0; grid-template-columns: auto minmax(0,1fr) auto; gap: 1rem; align-items: start; padding: 1.2rem; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(252,249,242,.58); box-shadow: var(--shadow-sm); }
 .settings-card-icon { display: grid; width: 42px; height: 42px; place-items: center; border-radius: 12px; color: var(--copper); background: rgba(155,88,59,.09); }
 .settings-card-icon svg { width: 19px; }
+.settings-danger-card { border-color: rgba(163,64,53,.25); }
+.settings-danger-card .settings-card-icon { color: var(--danger); background: rgba(163,64,53,.08); }
+.danger-callout { border-color: rgba(163,64,53,.22); background: rgba(163,64,53,.06); }
+.danger-callout > span { color: var(--danger); }
 .settings-card-copy h2, .settings-section-head h2 { margin: 0; font-family: Georgia,serif; font-size: 1.35rem; font-weight: 550; letter-spacing: -.025em; }
 .settings-card-copy > p:last-of-type { max-width: 620px; margin: .45rem 0 0; color: var(--ink-soft); font-size: .77rem; line-height: 1.55; }
 .settings-card-action { display: flex; gap: .65rem; align-items: center; justify-content: flex-end; }
