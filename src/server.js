@@ -9,7 +9,7 @@ import { AGENT_GUIDE } from './agent-guide.js';
 import { AGENT_TOOLS } from './agent-tools.js';
 import { AtlasError, errorBody, fail } from './errors.js';
 import { requireObject } from './domain.js';
-import { KNOWLEDGE_OPENAPI_SPEC, OPENAPI_SPEC } from './openapi.js';
+import { BROWSER_OPENAPI_SPEC, KNOWLEDGE_OPENAPI_SPEC, OPENAPI_SPEC } from './openapi.js';
 
 const DEFAULT_BODY_LIMIT = 1024 * 1024;
 const DEFAULT_IMPORT_LIMIT = 16 * 1024 * 1024;
@@ -226,6 +226,7 @@ async function routeApi(atlas, request, response, url, limits) {
       tools: AGENT_TOOLS,
       guide: AGENT_GUIDE,
       agentOpenapi: OPENAPI_SPEC,
+      browserOpenapi: BROWSER_OPENAPI_SPEC,
       knowledgeOpenapi: KNOWLEDGE_OPENAPI_SPEC,
     });
   }

@@ -11,12 +11,13 @@ secret has the form `atlas_...` and is displayed only once. Atlas stores only
 its SHA-256 verifier; rotation and revocation invalidate the prior key. Keys
 are installation-local and are excluded from encrypted backups.
 
-Settings also renders every discovery and read endpoint, its operation schema,
-the complete agent guide, and the complete OpenAPI 3.1 document from the same
-server-owned contract used by the authenticated resources. The Knowledge
-browser API appears separately with its own OpenAPI document so its unlocked
-create, edit, move, delete, and connection operations are not mistaken for
-read-only agent tools.
+Settings renders every Agent discovery and read endpoint, its operation schema,
+the complete agent guide, and the Agent OpenAPI 3.1 document from the same
+server-owned contract used by the authenticated resources. A second complete
+local API document lists every implemented non-agent `/api/*` operation,
+including lifecycle, Settings, records, goals, images, custom fields, links,
+Knowledge, and backups. The Knowledge-only document remains available in the
+reference payload for clients that need that narrower contract.
 
 The unlocked browser may inspect key state with `GET /api/agent-key`, generate
 or rotate with `POST /api/agent-key`, and revoke with `DELETE /api/agent-key`.
@@ -57,13 +58,13 @@ contains only `title`, `time` (`start_date`, `end_date`, `ongoing`), and
 `description`; missing optional values are `null` and partial dates are kept.
 
 `get_goals` returns `{ "goals": [...], "progressions": [...] }`. Goal nodes
-contain only `id`, `title`, `description`, `importance`, `target_date`, and
-recursive `subgoals`. `progressions` records each parent's ordered
-`subgoal_ids` and sibling prerequisite edges as
+contain only `id`, `title`, `description`, `importance`, `horizon`,
+`target_date`, and recursive `subgoals`. `progressions` records each parent's
+ordered `subgoal_ids` and sibling prerequisite edges as
 `{ prerequisite_goal_id, dependent_goal_id }`.
 
 `list_projects` returns alphabetically ordered `{ "projects": [...] }` items
-with only `title`, `description`, and `github_link`.
+with only `title`, `description`, `status`, and `github_link`.
 
 All operations omit trashed records. The API has no agent write operations,
 MCP surface, Knowledge export/import, plaintext Knowledge transfer, or reset

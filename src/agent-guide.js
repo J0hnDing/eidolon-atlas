@@ -34,23 +34,24 @@ export const AGENT_GUIDE = Object.freeze({
     },
     get_goals: {
       endpoint: '/api/agent/get_goals',
-      result: 'goals is an ordered recursive hierarchy. Each node contains only id, title, description, importance, target_date, and subgoals.',
+      result: 'goals is an ordered recursive hierarchy. Each node contains only id, title, description, importance, horizon, target_date, and subgoals.',
     },
     list_projects: {
       endpoint: '/api/agent/list_projects',
-      result: 'projects is alphabetically ordered and each item is {title, description, github_link}.',
+      result: 'projects is alphabetically ordered and each item is {title, description, status, github_link}.',
     },
   },
   goals: {
     hierarchy: 'subgoals is the canonical parent-child tree. A child appears exactly once below its parent and ordering follows the user-defined sibling order.',
     progression: 'progressions contains ordered subgoal_ids for each parent and prerequisite-to-dependent edges. An edge {prerequisite_goal_id, dependent_goal_id} means the prerequisite should be completed before the dependent; both goals are siblings under the same parent.',
     importance: 'importance is one of low, medium, or high. Existing goals without an explicit value are treated as medium.',
+    horizon: 'horizon is short, middle, long, or null when absent.',
     target_date: 'target_date preserves the stored partial date or is null when absent.',
   },
   response_interpretation: {
     nulls: 'Optional scalar fields are null rather than omitted.',
     ordering: 'Ordering in each response is intentional and stable for a given Atlas state; do not infer hidden fields.',
-    mutation: 'The agent API has no write, delete, move, or key-management tools. Use the browser session for user-authorized changes.',
+    mutation: 'The agent API has no write, delete, move, or key-management tools. Use the primitive unlocked browser API for user-authorized changes.',
   },
   agent_workflow: {
     state_model: 'Stateless. Each request is self-contained; Atlas does not maintain an agent cursor, selected record, or conversation state.',

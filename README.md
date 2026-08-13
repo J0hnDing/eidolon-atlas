@@ -16,7 +16,7 @@ The application runs on `127.0.0.1`, stores its data in SQLite, and encrypts
 all personal content with a passphrase-derived key. The browser provides the
 primary user interface. A small, read-only agent API is available when
 explicitly enabled with a local API key. Settings contains key management, the
-complete agent API reference, and access to Recently removed; see
+complete Agent and local browser API references, and access to Recently removed; see
 [Agent API](docs/agent-api.md).
 
 ## Requirements

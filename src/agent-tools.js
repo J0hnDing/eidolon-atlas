@@ -25,17 +25,16 @@ export const AGENT_TOOLS = Object.freeze([
   }),
   Object.freeze({
     name: 'get_goals',
-    description: 'Return the active goal hierarchy recursively, with importance and target dates, plus the sibling prerequisite DAG in an explicit edge list.',
+    description: 'Return the active goal hierarchy recursively, with importance, horizon, and target dates, plus the sibling prerequisite DAG in an explicit edge list.',
     method: 'POST',
     endpoint: '/api/agent/get_goals',
     input_schema: emptyInput,
   }),
   Object.freeze({
     name: 'list_projects',
-    description: 'Return active, non-trashed projects alphabetically with their descriptions and GitHub links.',
+    description: 'Return active, non-trashed projects alphabetically with their descriptions, statuses, and GitHub links.',
     method: 'POST',
     endpoint: '/api/agent/list_projects',
     input_schema: emptyInput,
   }),
 ]);
-

@@ -404,7 +404,8 @@ export class Atlas {
     for (const children of byParent.values()) children.sort((left, right) => left.position - right.position);
     const build = (goal) => ({ id: goal.id, title: goal.title,
       description: goal.data?.description ?? null, importance: goal.data?.importance ?? 'medium',
-      target_date: goal.data?.targetDate || null, subgoals: (byParent.get(goal.id) ?? []).map(build) });
+      horizon: goal.data?.horizon ?? null, target_date: goal.data?.targetDate || null,
+      subgoals: (byParent.get(goal.id) ?? []).map(build) });
     const progressions = records.filter((goal) => (byParent.get(goal.id) ?? []).length).map((parent) => {
       const children = byParent.get(parent.id);
       const ids = new Set(children.map((child) => child.id));
@@ -421,7 +422,8 @@ export class Atlas {
   listAgentProjects() {
     this.#requireUnlocked();
     const projects = this.listRecords({ category: 'project' }).map((record) => ({
-      title: record.title, description: record.data?.context ?? null, github_link: record.data?.githubLink || null,
+      title: record.title, description: record.data?.context ?? null, status: record.data?.status ?? null,
+      github_link: record.data?.githubLink || null,
     })).sort((left, right) => left.title.localeCompare(right.title, 'en-US', { sensitivity: 'base' }));
     return { projects };
   }

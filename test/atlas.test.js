@@ -213,9 +213,11 @@ test('agent key lifecycle stores only a verifier and read projections expose all
   assert.deepEqual(atlas.listAgentExperiences().experiences.map((item) => item.title), ['Later', 'Earlier']);
   const goals = atlas.getAgentGoals();
   assert.equal(goals.goals[0].importance, 'high');
+  assert.equal(goals.goals[0].horizon, 'long');
   assert.equal(goals.goals[0].subgoals[0].importance, 'medium');
   assert.deepEqual(goals.progressions[0].edges, [{ prerequisite_goal_id: first.id, dependent_goal_id: second.id }]);
   assert.deepEqual(atlas.listAgentProjects().projects.map((item) => item.title), ['Alpha', 'Zulu']);
+  assert.equal(atlas.listAgentProjects().projects[0].status, 'planned');
 
   const backup = await atlas.export(BACKUP_PASSPHRASE);
   const snapshotText = JSON.stringify(await openBackupEnvelope(BACKUP_PASSPHRASE, backup));

@@ -43,10 +43,11 @@ key and an unlocked Atlas. There are no agent mutation routes, MCP surface,
 plaintext Knowledge transfer, or Knowledge reset endpoint.
 
 The unlocked Settings page reads the same server-owned agent tool, guide, and
-OpenAPI objects plus a separate Knowledge OpenAPI document through
-`/api/settings/api-reference`; this browser route is not part of the
-Bearer-authenticated agent surface. Settings also owns key management and
-navigation into Recently removed.
+OpenAPI objects plus a complete OpenAPI document for every implemented
+non-agent `/api/*` operation through `/api/settings/api-reference`. The payload
+also retains the narrower Knowledge-only document for contract consumers. This
+browser route is not part of the Bearer-authenticated agent surface. Settings
+also owns key management and navigation into Recently removed.
 
 ## Reads and search
 

@@ -2105,7 +2105,7 @@ function renderSettings(keyStatus, reference) {
           element("code", { text: path })
         ]),
         element("h3", { text: operation.summary || tool?.name || path }),
-        element("p", { text: tool?.description || operation.description || "Authenticated agent resource." }),
+        element("p", { text: tool?.description || operation.description || "No operation description is available." }),
         element("div", { class: "api-endpoint-meta" }, [
           element("span", { text: method === "post" ? "Input: {} only" : "No request body" }),
           element("span", { text: `Responses: ${responses}` })
@@ -2132,12 +2132,20 @@ function renderSettings(keyStatus, reference) {
     ])
   ]);
   page.append(apiSection);
-  page.append(renderKnowledgeApiReference(reference?.knowledgeOpenapi || {}));
+  page.append(renderBrowserApiReference(reference?.browserOpenapi || reference?.knowledgeOpenapi || {}));
   stage.append(page);
   renderAgentKeyStatus(keyStatus);
 }
 
-function renderKnowledgeApiReference(spec) {
+function apiRequestLabel(operation) {
+  const contentTypes = Object.keys(operation.requestBody?.content || {});
+  if (!contentTypes.length) return "No request body";
+  const prefix = operation.requestBody?.required === false ? "Optional body" : "Body";
+  if (contentTypes.length === 1 && contentTypes[0] === "application/json") return `${prefix}: application/json`;
+  return `${prefix}: ${contentTypes.join(", ")}`;
+}
+
+function renderBrowserApiReference(spec) {
   const endpointList = element("div", { class: "api-endpoint-list" });
   for (const [path, pathItem] of Object.entries(spec.paths || {})) {
     for (const [method, operation] of Object.entries(pathItem)) {
@@ -2150,9 +2158,10 @@ function renderKnowledgeApiReference(spec) {
           element("code", { text: path })
         ]),
         element("h3", { text: operation.summary || path }),
-        element("p", { text: operation.description || "Epistome-compatible unlocked browser operation." }),
+        element("p", { text: operation.description || "No operation description is available." }),
         element("div", { class: "api-endpoint-meta" }, [
-          element("span", { text: operation.requestBody ? "JSON request body" : "No request body" }),
+          element("span", { text: apiRequestLabel(operation) }),
+          element("span", { text: `Group: ${(operation.tags || ["Local API"]).join(", ")}` }),
           element("span", { text: `Responses: ${responses}` })
         ]),
         element("details", { class: "api-schema" }, [
@@ -2165,18 +2174,18 @@ function renderKnowledgeApiReference(spec) {
   return element("section", { class: "settings-api" }, [
     element("header", { class: "settings-section-head" }, [
       element("div", {}, [
-        element("p", { class: "eyebrow", text: "OpenAPI 3.1 · Knowledge browser API" }),
-        element("h2", { text: spec.info?.title || "Knowledge API" }),
-        element("p", { text: spec.info?.description || "Epistome-compatible Knowledge hierarchy and connection operations." })
+        element("p", { class: "eyebrow", text: "OpenAPI 3.1 · Complete local API" }),
+        element("h2", { text: spec.info?.title || "Atlas Local API" }),
+        element("p", { text: spec.info?.description || "Every same-origin API implemented by the local Atlas server." })
       ]),
       element("div", { class: "api-facts" }, [
         element("span", {}, [element("strong", { text: "Base" }), element("code", { text: window.location.origin })]),
-        element("span", {}, [element("strong", { text: "Auth" }), element("code", { text: "Unlocked Atlas" })])
+        element("span", {}, [element("strong", { text: "Access" }), element("code", { text: "Local browser / Atlas state" })])
       ])
     ]),
     endpointList,
     element("div", { class: "api-reference-files single" }, [
-      element("details", { class: "api-schema" }, [element("summary", { text: "View complete Knowledge OpenAPI JSON" }), element("pre", { text: JSON.stringify(spec, null, 2) })])
+      element("details", { class: "api-schema" }, [element("summary", { text: "View complete local OpenAPI JSON" }), element("pre", { text: JSON.stringify(spec, null, 2) })])
     ])
   ]);
 }
@@ -2254,7 +2263,7 @@ async function clearAllAtlas(event) {
   const form = event.currentTarget;
   if (!form.reportValidity()) return;
   const button = $("#confirm-clear-all");
-  setButtonBusy(button, true, "Clearingâ€¦");
+  setButtonBusy(button, true, "Clearing…");
   try {
     await api("/reset", { method: "POST", body: { passphrase: form.elements.passphrase.value } });
     $("#clear-all-dialog").close();
