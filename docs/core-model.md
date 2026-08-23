@@ -39,6 +39,9 @@ goal. A goal has at most one parent; hierarchy and prerequisite cycles are
 invalid; sibling order is explicit. Each leaf goal stores progress from 0 to
 100, while parent progress rolls up evenly from its active direct subgoals.
 This progression is separate from ordinary cross-record links.
+Dedicated subgoal creation stores the new Goal and all selected sibling
+prerequisite edges in one transaction. A client-generated request UUID makes a
+retry return the original subgoal instead of creating a duplicate.
 
 ### Knowledge
 

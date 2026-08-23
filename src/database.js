@@ -129,6 +129,18 @@ const MIGRATIONS = [
       ) STRICT;
     `,
   },
+  {
+    version: 7,
+    sql: `
+      CREATE TABLE subgoal_requests (
+        request_id TEXT PRIMARY KEY,
+        record_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        FOREIGN KEY (record_id) REFERENCES records(id) ON DELETE CASCADE
+      ) STRICT;
+    `,
+  },
 ];
 
 export function openDatabase(path = 'data/atlas.sqlite') {

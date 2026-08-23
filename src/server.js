@@ -5,11 +5,9 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { Atlas, BACKUP_UPLOAD_MAX_BYTES, IMAGE_MAX_BYTES } from './atlas.js';
-import { AGENT_GUIDE } from './agent-guide.js';
-import { AGENT_TOOLS } from './agent-tools.js';
 import { AtlasError, errorBody, fail } from './errors.js';
 import { requireObject } from './domain.js';
-import { BROWSER_OPENAPI_SPEC, KNOWLEDGE_OPENAPI_SPEC, OPENAPI_SPEC } from './openapi.js';
+import { BROWSER_OPENAPI_SPEC, KNOWLEDGE_OPENAPI_SPEC } from './openapi.js';
 
 const DEFAULT_BODY_LIMIT = 1024 * 1024;
 const DEFAULT_IMPORT_LIMIT = 16 * 1024 * 1024;
@@ -26,6 +24,7 @@ function sendJson(response, status, value) {
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': body.length,
     'Cache-Control': 'no-store',
+    'Cross-Origin-Resource-Policy': 'same-origin',
     'X-Content-Type-Options': 'nosniff',
   });
   response.end(body);
@@ -137,56 +136,11 @@ function validateApiRequest(request) {
   }
 }
 
-function requireEmptyObject(body, label = 'request body') {
-  requireObject(body, label);
-  if (Object.keys(body).length > 0) {
-    fail(400, 'VALIDATION_ERROR', `${label} must be an empty JSON object.`);
-  }
-  return body;
-}
-
 function envelope(key, value) {
   if (value && typeof value === 'object' && !Array.isArray(value) && Object.hasOwn(value, key)) {
     return value;
   }
   return { [key]: value };
-}
-
-function agentEnvelope(key, value) {
-  if (value && typeof value === 'object' && !Array.isArray(value) && Object.hasOwn(value, key)) {
-    return value;
-  }
-  // The Atlas projection methods are expected to return the public payload,
-  // but accepting a raw array/object keeps the HTTP boundary resilient while
-  // the domain implementation is migrated.
-  if (key === 'goals' && value && typeof value === 'object' && !Array.isArray(value) && Object.hasOwn(value, 'progressions')) {
-    return { goals: value.goals ?? [], progressions: value.progressions };
-  }
-  return { [key]: value };
-}
-
-async function requireAgentAuthorization(atlas, request) {
-  const header = request.headers.authorization;
-  const match = typeof header === 'string' ? /^Bearer ([^\s]+)$/i.exec(header) : null;
-  if (!match) fail(401, 'UNAUTHORIZED', 'A valid bearer API key is required.');
-
-  let verified;
-  try {
-    verified = await atlas.verifyAgentKey(match[1]);
-  } catch (error) {
-    // Key verification is deliberately presented as one stable auth failure;
-    // only a real lock failure is allowed through to preserve the 423 contract.
-    if (error instanceof AtlasError && error.status === 423) throw error;
-    if (error instanceof AtlasError && [401, 404, 409].includes(error.status)) {
-      fail(401, 'UNAUTHORIZED', 'A valid bearer API key is required.');
-    }
-    throw error;
-  }
-  const valid = verified === true || (verified && typeof verified === 'object' &&
-    (verified.valid === true || verified.verified === true || verified.authorized === true));
-  if (!valid) fail(401, 'UNAUTHORIZED', 'A valid bearer API key is required.');
-  const status = atlas.status();
-  if (status.locked) fail(423, 'LOCKED', 'Atlas is locked.');
 }
 
 function uploadFilename(request) {
@@ -200,6 +154,7 @@ async function sendImage(response, image) {
     'Content-Type': image.metadata.mimeType,
     'Content-Length': image.bytes.length,
     'Cache-Control': 'no-store',
+    'Cross-Origin-Resource-Policy': 'same-origin',
     'X-Content-Type-Options': 'nosniff',
     'Content-Disposition': `inline; filename*=UTF-8''${encodeURIComponent(image.metadata.filename)}`,
   });
@@ -223,61 +178,13 @@ async function routeApi(atlas, request, response, url, limits) {
   if (method === 'GET' && path === '/api/settings/api-reference') {
     if (atlas.status().locked) fail(423, 'LOCKED', 'Atlas is locked.');
     return sendJson(response, 200, {
-      tools: AGENT_TOOLS,
-      guide: AGENT_GUIDE,
-      agentOpenapi: OPENAPI_SPEC,
       browserOpenapi: BROWSER_OPENAPI_SPEC,
       knowledgeOpenapi: KNOWLEDGE_OPENAPI_SPEC,
     });
   }
-  // API-key management is a same-origin browser capability.  The key secret
-  // is returned only by POST and is never exposed by the status endpoint.
-  if (path === '/api/agent-key') {
-    if (method === 'GET') return sendJson(response, 200, await atlas.getAgentKeyStatus());
-    if (method === 'POST') {
-      requireEmptyObject(await readJson(request, limits.body));
-      return sendJson(response, 201, await atlas.generateAgentKey());
-    }
-    if (method === 'DELETE') {
-      requireEmptyObject(await readJson(request, limits.body));
-      return sendJson(response, 200, await atlas.revokeAgentKey());
-    }
-  }
-  // Discovery is part of the authenticated agent surface.  This intentionally
-  // checks the bearer key before returning any guide or schema information.
-  if (path === '/api/openapi.json' && method === 'GET') {
-    await requireAgentAuthorization(atlas, request);
-    return sendJson(response, 200, OPENAPI_SPEC);
-  }
-  if (path === '/api/agent/guide' && method === 'GET') {
-    await requireAgentAuthorization(atlas, request);
-    return sendJson(response, 200, AGENT_GUIDE);
-  }
-  if (path === '/api/agent/tools' && method === 'GET') {
-    await requireAgentAuthorization(atlas, request);
-    return sendJson(response, 200, {
-      project: 'Eidolon-Atlas',
-      guide_url: '/api/agent/guide',
-      openapi_url: '/api/openapi.json',
-      tools: AGENT_TOOLS,
-    });
-  }
-  const agentReadRoutes = new Map([
-    ['/api/agent/get_personal_info', ['getAgentPersonalInfo', 'personal_info']],
-    ['/api/agent/list_experiences', ['listAgentExperiences', 'experiences']],
-    ['/api/agent/get_goals', ['getAgentGoals', 'goals']],
-    ['/api/agent/list_projects', ['listAgentProjects', 'projects']],
-  ]);
-  if (method === 'POST' && agentReadRoutes.has(path)) {
-    await requireAgentAuthorization(atlas, request);
-    requireEmptyObject(await readJson(request, limits.body));
-    const [operation, resultKey] = agentReadRoutes.get(path);
-    const result = await atlas[operation]();
-    return sendJson(response, 200, agentEnvelope(resultKey, result));
-  }
 
-  // Epistome-compatible browser Knowledge routes.  These remain on Atlas's
-  // unlocked browser session and use its normal error envelope.
+  // Epistome-compatible Knowledge routes use Atlas's unlocked local session
+  // and normal error envelope.
   if (method === 'GET' && path === '/api/knowledge/tree') {
     return sendJson(response, 200, envelope('branches', await atlas.getKnowledgeTree()));
   }
@@ -333,6 +240,10 @@ async function routeApi(atlas, request, response, url, limits) {
   }
   let match = /^\/api\/goals\/([^/]+)\/progression$/.exec(path);
   if (match && method === 'GET') return sendJson(response, 200, atlas.getGoalGraph(decodeSegment(match[1])));
+  match = /^\/api\/goals\/([^/]+)\/subgoals$/.exec(path);
+  if (match && method === 'POST') {
+    return sendJson(response, 201, atlas.createSubgoal(decodeSegment(match[1]), await readJson(request, limits.body)));
+  }
   match = /^\/api\/goals\/([^/]+)\/prerequisites$/.exec(path);
   if (match && method === 'POST') {
     const body = requireObject(await readJson(request, limits.body));
@@ -410,14 +321,15 @@ async function routeApi(atlas, request, response, url, limits) {
   }
   if (method === 'POST' && path === '/api/export') {
     const body = requirePassphraseBody(await readJson(request, limits.body));
-    const exported = await atlas.exportV2(body.passphrase);
-    response.writeHead(200, {
+    const exported = await atlas.exportV3(body.passphrase);
+    const headers = {
       'Content-Type': exported.contentType,
-      'Content-Length': exported.byteLength,
       'Content-Disposition': `attachment; filename="${exported.filename}"`,
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
-    });
+    };
+    if (exported.byteLength !== undefined) headers['Content-Length'] = exported.byteLength;
+    response.writeHead(200, headers);
     await pipeline(Readable.from(exported.stream), response);
     return;
   }

@@ -10,9 +10,16 @@ import { AtlasError, fail } from './errors.js';
 const scrypt = promisify(scryptCallback);
 export const DEFAULT_KDF = Object.freeze({ version: 1, name: 'scrypt', N: 1 << 15, r: 8, p: 1, keyLength: 32 });
 export const BACKUP_V2_MAGIC = Buffer.from('EIDOLON-ATLAS-BACKUP-V2\0', 'ascii');
+export const BACKUP_V3_MAGIC = Buffer.from('EIDOLON-ATLAS-BACKUP-V3\0', 'ascii');
 export const BACKUP_V2_MAX_HEADER_BYTES = 64 * 1024;
 export const BACKUP_V2_MAX_MANIFEST_BYTES = 16 * 1024 * 1024;
 const BACKUP_V2_TAG_BYTES = 16;
+
+function isSupportedKdf(parameters) {
+  return parameters?.version === DEFAULT_KDF.version && parameters.name === DEFAULT_KDF.name &&
+    parameters.N === DEFAULT_KDF.N && parameters.r === DEFAULT_KDF.r &&
+    parameters.p === DEFAULT_KDF.p && parameters.keyLength === DEFAULT_KDF.keyLength;
+}
 
 function requirePassphrase(passphrase, label = 'passphrase') {
   if (typeof passphrase !== 'string' || passphrase.length < 8) {
@@ -165,6 +172,9 @@ export async function openBackupEnvelope(passphrase, envelope) {
   if (salt.length !== 16) fail(400, 'INVALID_BACKUP', 'The backup salt is invalid.');
   const parameters = { ...envelope.kdf };
   delete parameters.salt;
+  if (!isSupportedKdf(parameters)) {
+    fail(400, 'INVALID_BACKUP', 'The backup key derivation parameters are unsupported.');
+  }
   const key = await deriveKey(passphrase, salt, parameters);
   try {
     let plaintext;
@@ -246,6 +256,40 @@ export async function createBackupV2Stream(passphrase, plaintextLength, plaintex
   return { stream: encrypted(), byteLength: prefix.length + plaintextLength + BACKUP_V2_TAG_BYTES };
 }
 
+export async function createBackupV3Stream(passphrase, plaintextSource) {
+  requirePassphrase(passphrase, 'backup passphrase');
+  const salt = randomBytes(16);
+  const nonce = randomBytes(12);
+  const kdf = { ...DEFAULT_KDF };
+  const header = Buffer.from(JSON.stringify({
+    format: 'eidolon-atlas-backup',
+    version: 3,
+    kdf: { ...kdf, salt: salt.toString('base64') },
+    cipher: { algorithm: 'aes-256-gcm', nonce: nonce.toString('base64') },
+  }), 'utf8');
+  if (header.length > BACKUP_V2_MAX_HEADER_BYTES) fail(500, 'INVALID_BACKUP_STATE', 'The backup header is too large.');
+  const prefix = Buffer.concat([BACKUP_V3_MAGIC, uint32(header.length), header]);
+  async function* encrypted() {
+    const key = await deriveKey(passphrase, salt, kdf);
+    const cipher = createCipheriv('aes-256-gcm', key, nonce, { authTagLength: BACKUP_V2_TAG_BYTES });
+    cipher.setAAD(prefix);
+    try {
+      yield prefix;
+      for await (const value of plaintextSource) {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        const ciphertext = cipher.update(chunk);
+        if (ciphertext.length) yield ciphertext;
+      }
+      const final = cipher.final();
+      if (final.length) yield final;
+      yield cipher.getAuthTag();
+    } finally {
+      key.fill(0);
+    }
+  }
+  return { stream: encrypted() };
+}
+
 export function parseBackupV2Prefix(prefix) {
   const minimum = BACKUP_V2_MAGIC.length + 4;
   if (!Buffer.isBuffer(prefix) || prefix.length < minimum ||
@@ -270,9 +314,7 @@ export function parseBackupV2Prefix(prefix) {
   const nonce = strictBase64(header.cipher.nonce, 12, 'The backup nonce');
   const parameters = { ...header.kdf };
   delete parameters.salt;
-  if (parameters.version !== DEFAULT_KDF.version || parameters.name !== DEFAULT_KDF.name ||
-      parameters.N !== DEFAULT_KDF.N || parameters.r !== DEFAULT_KDF.r ||
-      parameters.p !== DEFAULT_KDF.p || parameters.keyLength !== DEFAULT_KDF.keyLength) {
+  if (!isSupportedKdf(parameters)) {
     fail(400, 'INVALID_BACKUP', 'The backup key derivation parameters are unsupported.');
   }
   return { header, headerLength, salt, nonce, parameters };
@@ -281,6 +323,45 @@ export function parseBackupV2Prefix(prefix) {
 export async function createBackupV2Decipher(passphrase, prefix) {
   requirePassphrase(passphrase, 'backup passphrase');
   const parsed = parseBackupV2Prefix(prefix);
+  const key = await deriveKey(passphrase, parsed.salt, parsed.parameters);
+  const decipher = createDecipheriv('aes-256-gcm', key, parsed.nonce, { authTagLength: BACKUP_V2_TAG_BYTES });
+  decipher.setAAD(prefix);
+  return { decipher, key, tagBytes: BACKUP_V2_TAG_BYTES };
+}
+
+export function parseBackupV3Prefix(prefix) {
+  const minimum = BACKUP_V3_MAGIC.length + 4;
+  if (!Buffer.isBuffer(prefix) || prefix.length < minimum ||
+      !prefix.subarray(0, BACKUP_V3_MAGIC.length).equals(BACKUP_V3_MAGIC)) {
+    fail(400, 'INVALID_BACKUP', 'The backup is not a supported v3 container.');
+  }
+  const headerLength = prefix.readUInt32BE(BACKUP_V3_MAGIC.length);
+  if (headerLength < 2 || headerLength > BACKUP_V2_MAX_HEADER_BYTES || prefix.length !== minimum + headerLength) {
+    fail(400, 'INVALID_BACKUP', 'The backup header length is invalid.');
+  }
+  let header;
+  try {
+    header = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(prefix.subarray(minimum)));
+  } catch {
+    fail(400, 'INVALID_BACKUP', 'The backup header is invalid.');
+  }
+  if (!header || header.format !== 'eidolon-atlas-backup' || header.version !== 3 ||
+      !header.kdf || !header.cipher || header.cipher.algorithm !== 'aes-256-gcm') {
+    fail(400, 'INVALID_BACKUP', 'The backup header is invalid or unsupported.');
+  }
+  const salt = strictBase64(header.kdf.salt, 16, 'The backup salt');
+  const nonce = strictBase64(header.cipher.nonce, 12, 'The backup nonce');
+  const parameters = { ...header.kdf };
+  delete parameters.salt;
+  if (!isSupportedKdf(parameters)) {
+    fail(400, 'INVALID_BACKUP', 'The backup key derivation parameters are unsupported.');
+  }
+  return { header, headerLength, salt, nonce, parameters };
+}
+
+export async function createBackupV3Decipher(passphrase, prefix) {
+  requirePassphrase(passphrase, 'backup passphrase');
+  const parsed = parseBackupV3Prefix(prefix);
   const key = await deriveKey(passphrase, parsed.salt, parsed.parameters);
   const decipher = createDecipheriv('aes-256-gcm', key, parsed.nonce, { authTagLength: BACKUP_V2_TAG_BYTES });
   decipher.setAAD(prefix);

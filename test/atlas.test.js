@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { Atlas, IMAGE_MAX_BYTES, IMAGE_MAX_PER_EXPERIENCE } from '../src/atlas.js';
-import { createBackupEnvelope, deriveKey, encryptJson, objectAad, openBackupEnvelope } from '../src/crypto.js';
+import { BACKUP_V2_MAX_MANIFEST_BYTES, BACKUP_V3_MAGIC, createBackupEnvelope, deriveKey, encryptJson, objectAad, openBackupEnvelope } from '../src/crypto.js';
 import { createServer, listen } from '../src/server.js';
 
 const APP_PASSPHRASE = 'correct horse battery staple';
@@ -66,7 +68,7 @@ test('numbered migrations are idempotent across reopen', async (t) => {
   const first = new Atlas({ databasePath });
   await first.setup(APP_PASSPHRASE);
   assert.deepEqual(first.database.prepare('SELECT version FROM schema_migrations ORDER BY version').all()
-    .map((row) => row.version), [1, 2, 3, 4, 5, 6]);
+    .map((row) => row.version), [1, 2, 3, 4, 5, 6, 7]);
   first.close();
   const reopened = new Atlas({ databasePath });
   assert.deepEqual(reopened.status(), { initialized: true, locked: true });
@@ -138,6 +140,10 @@ test('knowledge is seeded once, encrypted at rest, and preserves hierarchy invar
   assert.equal(atlas.listKnowledgeNodes().length, 50);
   const root = atlas.createKnowledgeNode({ name: 'Private sentinel topic', branch: 'subjects',
     status: 'known', understanding: 'Private sentinel explanation', terms: [] });
+  assert.throws(() => atlas.createKnowledgeNode({ name: 'Typo', branch: 'subjects', statuz: 'known' }),
+    { code: 'UNEXPECTED_FIELD' });
+  assert.throws(() => atlas.patchKnowledgeNode(root.id, { understandng: 'Typo' }),
+    { code: 'UNEXPECTED_FIELD' });
   const child = atlas.createKnowledgeNode({ name: 'Nested topic', branch: 'subjects', parentId: root.id });
   assert.equal(child.parentId, root.id);
   assert.throws(() => atlas.createKnowledgeNode({ name: 'nested TOPIC', branch: 'subjects', parentId: root.id }),
@@ -184,52 +190,14 @@ test('knowledge round-trips in backups and legacy backups receive the standard t
   destination.close();
 });
 
-test('agent key lifecycle stores only a verifier and read projections expose allowlisted active data', async (t) => {
+test('opening Atlas purges the retired agent-key verifier metadata', async (t) => {
   const { atlas, databasePath } = await fixture(t);
-  const generated = atlas.generateAgentKey();
-  assert.match(generated.key, /^atlas_[A-Za-z0-9_-]{43}$/);
-  assert.equal(atlas.verifyAgentKey(generated.key), true);
-  assert.equal(atlas.verifyAgentKey(`${generated.key}x`), false);
-  const stored = atlas.database.prepare("SELECT value FROM metadata WHERE key = 'agent-key'").get().value;
-  assert.equal(stored.includes(generated.key), false);
-  assert.equal(JSON.parse(stored).verifier.length, 64);
-
-  create(atlas, 'person', 'Legal Name', { preferredName: 'Preferred', gender: 'x', birthDate: '2000',
-    birthPlace: 'Place', nationalities: ['One'], languages: ['English'], maritalStatus: '',
-    emails: ['me@example.test'], phoneNumbers: ['123'], address: 'Home', summary: 'Summary', notes: 'Notes',
-    passportNumber: 'SECRET', nationalIdNumber: 'SECRET2' });
-  create(atlas, 'experience', 'Earlier', { kind: 'event', startDate: '2020', narrative: 'Earlier description' });
-  create(atlas, 'experience', 'Later', { kind: 'period', startDate: '2024-02', ongoing: true, narrative: 'Later description' });
-  const root = create(atlas, 'goal', 'Outcome', { horizon: 'long', targetDate: '2030', description: 'Outcome description', progress: 0, importance: 'high' });
-  const first = create(atlas, 'goal', 'First', { horizon: 'short', description: '', progress: 0 }, { parentId: root.id });
-  const second = create(atlas, 'goal', 'Second', { horizon: 'short', description: '', progress: 0, importance: 'low' }, { parentId: root.id });
-  atlas.createGoalDependency(second.id, first.id);
-  create(atlas, 'project', 'Zulu', { context: 'Z project', status: 'active', githubLink: '' });
-  create(atlas, 'project', 'Alpha', { context: 'A project', status: 'planned', githubLink: 'https://github.com/example/a' });
-
-  const personal = atlas.getAgentPersonalInfo().personal_info;
-  assert.equal(personal.name, 'Legal Name');
-  assert.equal(Object.hasOwn(personal, 'passport_number'), false);
-  assert.deepEqual(atlas.listAgentExperiences().experiences.map((item) => item.title), ['Later', 'Earlier']);
-  const goals = atlas.getAgentGoals();
-  assert.equal(goals.goals[0].importance, 'high');
-  assert.equal(goals.goals[0].horizon, 'long');
-  assert.equal(goals.goals[0].subgoals[0].importance, 'medium');
-  assert.deepEqual(goals.progressions[0].edges, [{ prerequisite_goal_id: first.id, dependent_goal_id: second.id }]);
-  assert.deepEqual(atlas.listAgentProjects().projects.map((item) => item.title), ['Alpha', 'Zulu']);
-  assert.equal(atlas.listAgentProjects().projects[0].status, 'planned');
-
-  const backup = await atlas.export(BACKUP_PASSPHRASE);
-  const snapshotText = JSON.stringify(await openBackupEnvelope(BACKUP_PASSPHRASE, backup));
-  assert.equal(snapshotText.includes(generated.key), false);
-  assert.equal(snapshotText.includes(JSON.parse(stored).verifier), false);
-  const rotated = atlas.generateAgentKey();
-  assert.equal(atlas.verifyAgentKey(generated.key), false);
-  assert.equal(atlas.verifyAgentKey(rotated.key), true);
-  atlas.revokeAgentKey();
-  assert.equal(atlas.verifyAgentKey(rotated.key), false);
-  atlas.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
-  assert.equal((await readFile(databasePath)).includes(Buffer.from(generated.key)), false);
+  atlas.database.prepare("INSERT INTO metadata(key, value) VALUES ('agent-key', ?)")
+    .run(JSON.stringify({ verifier: 'legacy', prefix: 'atlas_legacy', createdAt: '2026-08-10T00:00:00.000Z' }));
+  atlas.close();
+  const reopened = new Atlas({ databasePath });
+  assert.equal(reopened.database.prepare("SELECT 1 FROM metadata WHERE key = 'agent-key'").get(), undefined);
+  reopened.close();
 });
 
 test('user content is encrypted and tampering and wrong passphrases fail closed', async (t) => {
@@ -257,26 +225,103 @@ test('locking removes access to protected operations', async (t) => {
   assert.deepEqual(atlas.status(), { initialized: true, locked: true });
 });
 
+test('lifecycle transitions serialize setup and invalidate an unlock overtaken by lock', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'atlas-lifecycle-test-'));
+  const atlas = new Atlas({ databasePath: join(directory, 'atlas.sqlite') });
+  t.after(async () => {
+    try { atlas.close(); } catch {}
+    await rm(directory, { recursive: true, force: true });
+  });
+  const alternatePassphrase = 'alternate concurrent setup passphrase';
+  const results = await Promise.allSettled([atlas.setup(APP_PASSPHRASE), atlas.setup(alternatePassphrase)]);
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+  assert.equal(results.find((result) => result.status === 'rejected').reason.code, 'ALREADY_INITIALIZED');
+  const winningPassphrase = results[0].status === 'fulfilled' ? APP_PASSPHRASE : alternatePassphrase;
+  const record = create(atlas, 'preference', 'Still decryptable', { value: 'after concurrent setup' });
+  atlas.lock();
+  const pendingUnlock = atlas.unlock(winningPassphrase);
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  atlas.lock();
+  await assert.rejects(pendingUnlock, { code: 'LIFECYCLE_CHANGED' });
+  assert.deepEqual(atlas.status(), { initialized: true, locked: true });
+  await atlas.unlock(winningPassphrase);
+  assert.equal(atlas.getRecord(record.id).title, 'Still decryptable');
+  const pendingClear = atlas.clearAll(winningPassphrase);
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  atlas.lock();
+  await assert.rejects(pendingClear, { code: 'LIFECYCLE_CHANGED' });
+  await atlas.unlock(winningPassphrase);
+  assert.equal(atlas.getRecord(record.id).title, 'Still decryptable');
+});
+
+test('database lease prevents a second instance from deleting active staging', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'atlas-lease-test-'));
+  const databasePath = join(directory, 'atlas.sqlite');
+  const atlas = new Atlas({ databasePath });
+  await atlas.setup(APP_PASSPHRASE);
+  t.after(async () => {
+    try { atlas.close(); } catch {}
+    await rm(directory, { recursive: true, force: true });
+  });
+  const staged = await atlas.stageImportUpload([Buffer.from('active staged upload')]);
+  assert.throws(() => new Atlas({ databasePath }), { code: 'ATLAS_INSTANCE_ACTIVE' });
+  assert.deepEqual(await readFile(join(`${databasePath}.imports`, `${staged.uploadId}.upload`)), Buffer.from('active staged upload'));
+  await atlas.cancelImportUpload(staged.uploadId);
+  atlas.close();
+  const reopened = new Atlas({ databasePath });
+  reopened.close();
+});
+
+test('database lease is exclusive across Atlas processes', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'atlas-process-lease-test-'));
+  const databasePath = join(directory, 'atlas.sqlite');
+  const child = spawn(process.execPath, ['--input-type=module', '--eval', `
+    import { Atlas } from './src/atlas.js';
+    const atlas = new Atlas({ databasePath: process.argv[1] });
+    process.send('ready');
+    process.on('message', () => { atlas.close(); process.exit(0); });
+  `, databasePath], {
+    cwd: new URL('..', import.meta.url),
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+  });
+  t.after(async () => {
+    if (child.exitCode === null) child.kill();
+    await rm(directory, { recursive: true, force: true });
+  });
+  const ready = await new Promise((resolvePromise, reject) => {
+    const onMessage = (message) => { cleanup(); resolvePromise(message); };
+    const onExit = (code) => { cleanup(); reject(new Error(`Lease child exited early with ${code}.`)); };
+    const cleanup = () => { child.off('message', onMessage); child.off('exit', onExit); };
+    child.once('message', onMessage);
+    child.once('exit', onExit);
+  });
+  assert.equal(ready, 'ready');
+  assert.throws(() => new Atlas({ databasePath }), { code: 'ATLAS_INSTANCE_ACTIVE' });
+  child.send('close');
+  const [exitCode] = await once(child, 'exit');
+  assert.equal(exitCode, 0);
+  const reopened = new Atlas({ databasePath });
+  reopened.close();
+});
+
 test('clear all verifies the current passphrase and returns Atlas to first-time setup', async (t) => {
   const { atlas } = await fixture(t);
   const record = create(atlas, 'preference', 'Keep until authenticated', { value: 'private' });
   atlas.createCustomField({ category: 'preference', name: 'Private note', type: 'text' });
-  const agent = atlas.generateAgentKey();
   const staged = await atlas.stageImportUpload([Buffer.from('staged encrypted backup')]);
 
   await assert.rejects(atlas.clearAll('this is the wrong passphrase'), { code: 'INVALID_PASSPHRASE' });
   assert.equal(atlas.getRecord(record.id).title, 'Keep until authenticated');
-  assert.equal(atlas.verifyAgentKey(agent.key), true);
 
   assert.deepEqual(await atlas.clearAll(APP_PASSPHRASE), { initialized: false, locked: true });
   const clearedTables = [
     'metadata', 'records', 'record_revisions', 'custom_fields', 'links', 'record_images',
-    'goal_dependencies', 'knowledge_nodes', 'knowledge_connections', 'knowledge_metadata',
+    'goal_dependencies', 'subgoal_requests', 'knowledge_nodes', 'knowledge_connections', 'knowledge_metadata',
   ];
   for (const table of clearedTables) {
     assert.equal(atlas.database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count, 0, table);
   }
-  assert.equal(atlas.database.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get().count, 6);
+  assert.equal(atlas.database.prepare('SELECT COUNT(*) AS count FROM schema_migrations').get().count, 7);
   await assert.rejects(atlas.unlock(APP_PASSPHRASE), { code: 'NOT_INITIALIZED' });
 
   const newPassphrase = 'a completely new atlas passphrase';
@@ -347,6 +392,39 @@ test('goal progression is a sibling DAG with recursive progress roll-up and port
   assert.equal(atlas.getGoalGraph(root.id).dependencies.length, 0);
 });
 
+test('subgoal creation is transactional and idempotent with prerequisite edges', async (t) => {
+  const { atlas } = await fixture(t);
+  const root = create(atlas, 'goal', 'Atomic progression', { horizon: 'long' });
+  const prerequisite = create(atlas, 'goal', 'First step', { horizon: 'short', progress: 100 }, { parentId: root.id });
+  const request = {
+    requestId: '11111111-1111-4111-8111-111111111111',
+    title: 'Second step',
+    data: { horizon: 'short', importance: 'medium', targetDate: '', description: '', progress: 0 },
+    customFieldValues: {}, prerequisiteIds: [prerequisite.id],
+  };
+  const created = atlas.createSubgoal(root.id, request);
+  assert.equal(created.created, true);
+  assert.deepEqual(atlas.getGoalGraph(root.id).dependencies.map((edge) => [edge.goalId, edge.prerequisiteId]), [
+    [created.record.id, prerequisite.id],
+  ]);
+  const replayed = atlas.createSubgoal(root.id, request);
+  assert.equal(replayed.created, false);
+  assert.equal(replayed.record.id, created.record.id);
+  assert.equal(atlas.getGoalGraph(root.id).nodes.filter((node) => node.title === 'Second step').length, 1);
+  assert.throws(() => atlas.createSubgoal(root.id, { ...request, title: 'Different request' }),
+    { code: 'IDEMPOTENCY_CONFLICT' });
+
+  atlas.database.exec(`CREATE TRIGGER reject_test_subgoal_dependency BEFORE INSERT ON goal_dependencies
+    BEGIN SELECT RAISE(ABORT, 'forced dependency failure'); END;`);
+  const before = atlas.getGoalGraph(root.id).nodes.length;
+  assert.throws(() => atlas.createSubgoal(root.id, {
+    ...request, requestId: '22222222-2222-4222-8222-222222222222', title: 'Must roll back',
+  }));
+  atlas.database.exec('DROP TRIGGER reject_test_subgoal_dependency;');
+  assert.equal(atlas.getGoalGraph(root.id).nodes.length, before);
+  assert.equal(atlas.database.prepare('SELECT COUNT(*) AS count FROM subgoal_requests').get().count, 1);
+});
+
 test('optimistic edits, no-ops, revisions, and historical restore work', async (t) => {
   const { atlas } = await fixture(t);
   const original = create(atlas, 'preference', 'Theme', { value: 'dark' });
@@ -393,6 +471,26 @@ test('typed custom fields and encrypted links are included in record detail', as
   for (const privateText of ['Favorite color', 'explains', 'private note']) {
     assert.equal(bytes.includes(Buffer.from(privateText)), false);
   }
+});
+
+test('custom field edits preserve unique names and restorable revision values', async (t) => {
+  const { atlas } = await fixture(t);
+  const choice = atlas.createCustomField({ category: 'preference', name: 'Choice', type: 'singleChoice', options: ['old', 'new'] });
+  const other = atlas.createCustomField({ category: 'preference', name: 'Other', type: 'text' });
+  assert.throws(() => atlas.patchCustomField(other.id, { name: 'cHoIcE' }), { code: 'CUSTOM_FIELD_EXISTS' });
+
+  const original = atlas.createRecord({ category: 'preference', title: 'Setting', data: { value: 'example' },
+    customFieldValues: { [choice.id]: 'old' } });
+  atlas.patchRecord(original.id, { revision: original.revision, customFieldValues: { [choice.id]: 'new' } });
+  assert.throws(() => atlas.patchCustomField(choice.id, { options: ['new'] }), { code: 'VALIDATION_ERROR' });
+  assert.equal(atlas.restoreRevision(original.id, 1).customFieldValues[choice.id], 'old');
+});
+
+test('legacy backups reject unsupported KDF cost before deriving a key', async () => {
+  const envelope = await createBackupEnvelope(BACKUP_PASSPHRASE, { format: 'test' });
+  const expensive = structuredClone(envelope);
+  expensive.kdf.N *= 2;
+  await assert.rejects(openBackupEnvelope(BACKUP_PASSPHRASE, expensive), { code: 'INVALID_BACKUP' });
 });
 
 test('unused custom fields are deleted rather than archived', async (t) => {
@@ -502,6 +600,42 @@ async function collect(source) {
   for await (const chunk of source) chunks.push(Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
+
+test('framed v3 backups exceed the legacy manifest ceiling and import incrementally', async (t) => {
+  const source = await fixture(t);
+  const value = 'x'.repeat(512 * 1024);
+  for (let index = 0; index < 17; index += 1) {
+    create(source.atlas, 'preference', `Large preference ${index}`, { value });
+  }
+  const exported = await source.atlas.exportV3(BACKUP_PASSPHRASE);
+  const backup = await collect(exported.stream);
+  assert.equal(backup.subarray(0, BACKUP_V3_MAGIC.length).equals(BACKUP_V3_MAGIC), true);
+  assert.ok(backup.length > BACKUP_V2_MAX_MANIFEST_BYTES);
+
+  const destination = await fixture(t);
+  const staged = await destination.atlas.stageImportUpload([backup]);
+  assert.deepEqual(await destination.atlas.commitImportUpload(staged.uploadId, BACKUP_PASSPHRASE), {
+    imported: true, records: 17, images: 0,
+  });
+  assert.equal(destination.atlas.listRecords({ category: 'preference' }).length, 17);
+  assert.equal(destination.atlas.listRecords({ category: 'preference' })[0].data.value.length, value.length);
+
+  const retained = create(destination.atlas, 'preference', 'Retained after tamper', { value: true });
+  const tampered = Buffer.from(backup);
+  tampered[tampered.length - 32] ^= 0xff;
+  const badStage = await destination.atlas.stageImportUpload([tampered]);
+  await assert.rejects(destination.atlas.commitImportUpload(badStage.uploadId, BACKUP_PASSPHRASE),
+    { code: 'INVALID_BACKUP_PASSPHRASE' });
+  assert.equal(destination.atlas.getRecord(retained.id).title, 'Retained after tamper');
+
+  const interruptedStage = await destination.atlas.stageImportUpload([backup]);
+  const interruptedCommit = destination.atlas.commitImportUpload(interruptedStage.uploadId, BACKUP_PASSPHRASE);
+  await new Promise((resolvePromise) => setImmediate(resolvePromise));
+  destination.atlas.lock();
+  await assert.rejects(interruptedCommit, { code: 'LIFECYCLE_CHANGED' });
+  await destination.atlas.unlock(APP_PASSPHRASE);
+  assert.equal(destination.atlas.getRecord(retained.id).title, 'Retained after tamper');
+});
 
 test('streamed v2 backup round-trips images and rejects tampering atomically', async (t) => {
   const source = await fixture(t);
@@ -619,6 +753,32 @@ test('HTTP reset requires the current passphrase and supports clean setup afterw
   assert.deepEqual(JSON.parse((await rawRequest(port, { path: '/api/records' })).body), []);
 });
 
+test('HTTP subgoal endpoint commits the record and prerequisite edges together', async (t) => {
+  const { atlas, directory } = await fixture(t);
+  const publicDir = join(directory, 'public');
+  const { mkdir } = await import('node:fs/promises');
+  await mkdir(publicDir);
+  await writeFile(join(publicDir, 'index.html'), '<!doctype html><title>Atlas</title>');
+  const root = create(atlas, 'goal', 'HTTP progression', { horizon: 'long' });
+  const prerequisite = create(atlas, 'goal', 'HTTP prerequisite', { horizon: 'short' }, { parentId: root.id });
+  const server = createServer({ atlas, publicDir });
+  const address = await listen(server, { port: 0 });
+  t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
+  const response = await rawRequest(address.port, {
+    method: 'POST', path: `/api/goals/${root.id}/subgoals`, headers: { 'content-type': 'application/json' },
+    chunks: [Buffer.from(JSON.stringify({
+      requestId: '33333333-3333-4333-8333-333333333333', title: 'HTTP atomic subgoal',
+      data: { horizon: 'short', importance: 'medium', targetDate: '', description: '', progress: 0 },
+      customFieldValues: {}, prerequisiteIds: [prerequisite.id],
+    }))],
+  });
+  assert.equal(response.status, 201);
+  const created = JSON.parse(response.body);
+  assert.equal(created.created, true);
+  assert.equal(created.record.parentId, root.id);
+  assert.deepEqual(atlas.getGoalGraph(root.id).dependencies.map((edge) => edge.goalId), [created.record.id]);
+});
+
 test('HTTP image and streamed backup endpoints preserve binary contracts', async (t) => {
   const { atlas, directory } = await fixture(t);
   const publicDir = join(directory, 'public');
@@ -644,6 +804,7 @@ test('HTTP image and streamed backup endpoints preserve binary contracts', async
   assert.equal(content.status, 200);
   assert.equal(content.headers['content-type'], 'image/png');
   assert.equal(content.headers['cache-control'], 'no-store');
+  assert.equal(content.headers['cross-origin-resource-policy'], 'same-origin');
   assert.deepEqual(content.body, bytes);
 
   const exported = await rawRequest(port, {

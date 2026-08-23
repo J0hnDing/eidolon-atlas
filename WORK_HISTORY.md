@@ -127,3 +127,16 @@ Added a Settings danger-zone Clear All flow that requires the current atlas pass
 ### Limitations
 
 SQLite schema migrations are intentionally preserved so the existing database can be initialized again; no browser automation was run.
+
+## 2026-08-12 22:51 — Correct Settings API reference descriptions
+
+- Category: bugfix
+- Area: Settings and OpenAPI
+
+### Summary
+
+Added distinct operation descriptions to all Knowledge and Agent OpenAPI operations, replaced misleading generic UI fallbacks, corrected related Knowledge schema and error-response drift, fixed the Knowledge tree HTTP fixture, and repaired a Settings loading-label encoding error. npm run check and live HTTP contract verification passed.
+
+### Limitations
+
+In-app visual browser automation was unavailable due to a runtime bootstrap conflict; the restarted production server is locked and requires the user to unlock it before manual Settings inspection.

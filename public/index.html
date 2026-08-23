@@ -65,7 +65,7 @@
           <input id="global-search" type="search" placeholder="Search your atlas" autocomplete="off">
           <kbd aria-hidden="true">/</kbd>
         </label>
-        <button id="new-record-top" class="button button-primary compact" type="button"><span data-icon="plus"></span><span class="button-label">Add entry</span></button>
+        <button id="new-record-top" class="button button-primary compact" type="button" aria-label="Add entry"><span data-icon="plus"></span><span class="button-label">Add entry</span></button>
       </header>
 
       <main id="main-content" class="main-content" tabindex="-1">
@@ -90,7 +90,7 @@
       </main>
     </section>
 
-    <aside id="detail-pane" class="detail-pane" aria-labelledby="detail-title" aria-hidden="true">
+    <aside id="detail-pane" class="detail-pane" aria-labelledby="detail-title" aria-hidden="true" inert>
       <header class="detail-header">
         <button id="close-detail" class="icon-button" type="button" aria-label="Close details" data-icon="close"></button>
         <div class="detail-header-actions">
@@ -104,7 +104,7 @@
 
   <div id="notice-region" class="notice-region" aria-live="polite" aria-atomic="true"></div>
 
-  <dialog id="record-dialog" class="modal">
+  <dialog id="record-dialog" class="modal" aria-labelledby="record-dialog-title">
     <form id="record-form" method="dialog">
       <header class="modal-header"><div><p id="record-eyebrow" class="eyebrow"></p><h2 id="record-dialog-title"></h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div id="record-fields" class="modal-body form-grid"></div>
@@ -112,22 +112,22 @@
     </form>
   </dialog>
 
-  <dialog id="backup-dialog" class="modal modal-small">
+  <dialog id="backup-dialog" class="modal modal-small" aria-labelledby="backup-dialog-title">
     <form id="backup-form" method="dialog">
-      <header class="modal-header"><div><p class="eyebrow">Encrypted portability</p><h2>Backup &amp; restore</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <header class="modal-header"><div><p class="eyebrow">Encrypted portability</p><h2 id="backup-dialog-title">Backup &amp; restore</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body stack">
         <div class="callout"><span data-icon="shield"></span><p>Backups are encrypted envelopes. Keep the file and its passphrase safe.</p></div>
         <div class="backup-choice"><div><strong>Export atlas</strong><p>Download an encrypted binary <code>.atlas</code> backup.</p></div><button id="export-button" class="button button-secondary" type="button">Export</button></div>
         <div class="divider"><span>or restore</span></div>
         <label class="field"><span>Encrypted backup file</span><input id="import-file" type="file" accept=".atlas,.json,.atlas.json,application/vnd.eidolon-atlas-backup,application/octet-stream,application/json"></label>
         <label class="field"><span>Backup passphrase</span><input id="backup-passphrase" type="password" autocomplete="off"></label>
-        <label class="check-row"><input id="import-confirm" type="checkbox"><span>I understand that importing may replace matching entries.</span></label>
+        <label class="check-row"><input id="import-confirm" type="checkbox"><span>I understand that importing replaces the entire current atlas with the selected backup.</span></label>
       </div>
       <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Close</button><button id="import-button" class="button button-primary" type="button" disabled><span data-icon="upload"></span>Import backup</button></footer>
     </form>
   </dialog>
 
-  <dialog id="secret-dialog" class="modal modal-small">
+  <dialog id="secret-dialog" class="modal modal-small" aria-labelledby="secret-title">
     <form id="secret-form" method="dialog">
       <header class="modal-header"><div><p class="eyebrow">Confirm encryption</p><h2 id="secret-title">Export backup</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body stack"><p id="secret-copy" class="muted"></p><label class="field"><span>Passphrase</span><input id="secret-passphrase" type="password" autocomplete="off" required></label></div>
@@ -135,11 +135,11 @@
     </form>
   </dialog>
 
-  <dialog id="clear-all-dialog" class="modal modal-small">
+  <dialog id="clear-all-dialog" class="modal modal-small" aria-labelledby="clear-all-dialog-title">
     <form id="clear-all-form" method="dialog">
-      <header class="modal-header"><div><p class="eyebrow">Irreversible reset</p><h2>Clear all atlas data</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <header class="modal-header"><div><p class="eyebrow">Irreversible reset</p><h2 id="clear-all-dialog-title">Clear all atlas data</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body stack">
-        <div class="callout danger-callout"><span data-icon="shield"></span><p>This permanently deletes every entry, revision, link, attachment, custom field, Knowledge item, agent key, and encryption credential. Back up anything you want to keep first.</p></div>
+        <div class="callout danger-callout"><span data-icon="shield"></span><p>This permanently deletes every entry, revision, link, attachment, custom field, Knowledge item, and encryption credential. Back up anything you want to keep first.</p></div>
         <label class="field"><span>Current atlas passphrase</span><input name="passphrase" type="password" autocomplete="current-password" required></label>
         <label class="check-row"><input name="acknowledge" type="checkbox" required><span>I understand that this cannot be undone.</span></label>
       </div>
@@ -147,9 +147,9 @@
     </form>
   </dialog>
 
-  <dialog id="link-dialog" class="modal modal-small">
+  <dialog id="link-dialog" class="modal modal-small" aria-labelledby="link-dialog-title">
     <form id="link-form" method="dialog">
-      <header class="modal-header"><div><p class="eyebrow">Connect your atlas</p><h2>Add a cross-link</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <header class="modal-header"><div><p class="eyebrow">Connect your atlas</p><h2 id="link-dialog-title">Add a cross-link</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body stack">
         <label class="field"><span>Entry</span><select id="link-target" required></select></label>
         <label class="field"><span>Relationship label</span><input id="link-label" maxlength="80" placeholder="e.g. inspired by, supports" required></label>
@@ -158,9 +158,9 @@
     </form>
   </dialog>
 
-  <dialog id="field-dialog" class="modal modal-small">
+  <dialog id="field-dialog" class="modal modal-small" aria-labelledby="field-dialog-title">
     <form id="field-form" method="dialog">
-      <header class="modal-header"><div><p class="eyebrow">Your structure</p><h2>Add custom field</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <header class="modal-header"><div><p class="eyebrow">Your structure</p><h2 id="field-dialog-title">Add custom field</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body form-grid">
         <label class="field full"><span>Field name</span><input name="label" maxlength="60" required></label>
         <label class="field"><span>Workspace</span><select name="category" required></select></label>
@@ -171,7 +171,7 @@
     </form>
   </dialog>
 
-  <dialog id="knowledge-node-dialog" class="modal">
+  <dialog id="knowledge-node-dialog" class="modal" aria-labelledby="knowledge-node-dialog-title">
     <form id="knowledge-node-form" method="dialog">
       <header class="modal-header"><div><p class="eyebrow">Knowledge structure</p><h2 id="knowledge-node-dialog-title">Add concept</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body form-grid">
@@ -186,17 +186,17 @@
     </form>
   </dialog>
 
-  <dialog id="knowledge-connection-dialog" class="modal modal-small">
+  <dialog id="knowledge-connection-dialog" class="modal modal-small" aria-labelledby="knowledge-connection-dialog-title">
     <form id="knowledge-connection-form" method="dialog">
-      <header class="modal-header"><div><p class="eyebrow">Knowledge connection</p><h2>Add connection</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
+      <header class="modal-header"><div><p class="eyebrow">Knowledge connection</p><h2 id="knowledge-connection-dialog-title">Add connection</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Close" data-icon="close"></button></header>
       <div class="modal-body stack"><label class="field"><span>Related concept</span><select name="targetId" required></select></label><p class="muted">Connections are undirected and do not change where a concept belongs in the tree.</p></div>
       <footer class="modal-footer"><button class="button button-quiet" type="button" data-close-dialog>Cancel</button><button class="button button-primary" type="submit">Add connection</button></footer>
     </form>
   </dialog>
 
-  <dialog id="prompt-dialog" class="modal onboarding-modal">
+  <dialog id="prompt-dialog" class="modal onboarding-modal" aria-labelledby="prompt-dialog-title">
     <form id="prompt-form" method="dialog">
-      <header class="modal-header"><div><p class="eyebrow">A quiet beginning</p><h2>Place a few markers</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Skip prompts" data-icon="close"></button></header>
+      <header class="modal-header"><div><p class="eyebrow">A quiet beginning</p><h2 id="prompt-dialog-title">Place a few markers</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Skip prompts" data-icon="close"></button></header>
       <div class="modal-body">
         <p class="prompt-intro">Start with neutral placeholders and refine them whenever you like. Nothing here guesses who you are.</p>
         <div id="prompt-options" class="prompt-options"></div>

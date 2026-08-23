@@ -14,10 +14,9 @@ connected kinds of information in one place:
 
 The application runs on `127.0.0.1`, stores its data in SQLite, and encrypts
 all personal content with a passphrase-derived key. The browser provides the
-primary user interface. A small, read-only agent API is available when
-explicitly enabled with a local API key. Settings contains key management, the
-complete Agent and local browser API references, and access to Recently removed; see
-[Agent API](docs/agent-api.md).
+primary user interface. Trusted local integrations can use the same native API
+while Atlas is unlocked. Settings contains the complete native API reference
+and access to Recently removed.
 
 ## Requirements
 
@@ -43,8 +42,9 @@ npm run dev
 ```
 
 The database path defaults to `data/atlas.sqlite`. Set `ATLAS_DATABASE` to use
-another local path. The server intentionally cannot bind to a non-loopback
-host.
+another local path, or `ATLAS_PORT` to choose another loopback port.
+`ATLAS_PUBLIC_DIR` can point development builds at a different static asset
+directory. The server intentionally cannot bind to a non-loopback host.
 
 ## Verify
 
@@ -61,11 +61,11 @@ at rest. Minimal structural metadata, including attachment association and
 count, timestamps, and approximate attachment size, remains visible in SQLite.
 Restarting the server or choosing **Lock** removes the derived key from memory.
 
-Exports are versioned `.atlas` files: backup v2 streams encrypted binary data
-and imports decrypt into a staged area without writing decrypted temporary
-images, then atomically replace the atlas. Backup v1 JSON envelopes remain
-import-compatible.
+Exports are versioned `.atlas` files: backup v3 streams individually framed
+records, revisions, Knowledge entries, and images without a whole-atlas
+manifest limit. Imports use encrypted staging and atomically replace the
+atlas without decrypted temporary images. Backup v1 JSON and v2 binary files
+remain import-compatible.
 
-See [Core model](docs/core-model.md), [Architecture](docs/architecture.md),
-[Security](docs/security.md), and [Agent guide](docs/agent-guide.md) for the
-product contracts and limitations.
+See [Core model](docs/core-model.md), [Architecture](docs/architecture.md), and
+[Security](docs/security.md) for the product contracts and limitations.

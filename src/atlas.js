@@ -1,12 +1,12 @@
-import { createReadStream, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, createReadStream, mkdirSync, openSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { open, rm, writeFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { openDatabase, transaction } from './database.js';
 import {
-  BACKUP_V2_MAGIC, BACKUP_V2_MAX_HEADER_BYTES, BACKUP_V2_MAX_MANIFEST_BYTES, DEFAULT_KDF, createBackupEnvelope,
-  createBackupV2Decipher, createBackupV2Stream, decryptBinary, decryptJson, deriveKey,
+  BACKUP_V2_MAGIC, BACKUP_V3_MAGIC, BACKUP_V2_MAX_HEADER_BYTES, BACKUP_V2_MAX_MANIFEST_BYTES, DEFAULT_KDF, createBackupEnvelope,
+  createBackupV2Decipher, createBackupV2Stream, createBackupV3Decipher, createBackupV3Stream, decryptBinary, decryptJson, deriveKey,
   encryptBinary, encryptJson, makeKeyCheck, objectAad, openBackupEnvelope, verifyKeyCheck,
 } from './crypto.js';
 import {
@@ -21,14 +21,84 @@ import {
 
 const KEY_CONFIG = 'encryption-config';
 const KEY_CHECK = 'key-check';
-const AGENT_KEY = 'agent-key';
+const LEGACY_AGENT_KEY = 'agent-key';
 export const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const IMAGE_MAX_PER_EXPERIENCE = 50;
 export const BACKUP_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
 const IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 const UPLOAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const ARCHIVE_FRAME_MAX_BYTES = BACKUP_V2_MAX_MANIFEST_BYTES;
 
 function now() { return new Date().toISOString(); }
+function processIsActive(pid) {
+  if (!Number.isInteger(pid) || pid < 1) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== 'ESRCH';
+  }
+}
+
+function acquireDatabaseLease(databasePath) {
+  if (databasePath === ':memory:') return null;
+  const path = `${resolve(databasePath)}.atlas.lock`;
+  mkdirSync(resolve(path, '..'), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const token = randomUUID();
+    let descriptor;
+    try {
+      descriptor = openSync(path, 'wx', 0o600);
+      writeFileSync(descriptor, JSON.stringify({ pid: process.pid, token, createdAt: now() }), 'utf8');
+      return { descriptor, path, token };
+    } catch (error) {
+      if (descriptor !== undefined) closeSync(descriptor);
+      if (error?.code !== 'EEXIST') throw error;
+      let holder;
+      try {
+        holder = JSON.parse(readFileSync(path, 'utf8'));
+      } catch {
+        fail(409, 'ATLAS_INSTANCE_ACTIVE', 'This atlas database is already owned by another process.');
+      }
+      if (processIsActive(holder?.pid)) {
+        fail(409, 'ATLAS_INSTANCE_ACTIVE', 'This atlas database is already owned by another process.', { pid: holder.pid });
+      }
+      try {
+        unlinkSync(path);
+      } catch (unlinkError) {
+        if (unlinkError?.code !== 'ENOENT') throw unlinkError;
+      }
+    }
+  }
+  fail(409, 'ATLAS_INSTANCE_ACTIVE', 'This atlas database is already owned by another process.');
+}
+
+function releaseDatabaseLease(lease) {
+  if (!lease) return;
+  try { closeSync(lease.descriptor); } catch { /* best effort close */ }
+  try {
+    const holder = JSON.parse(readFileSync(lease.path, 'utf8'));
+    if (holder?.token === lease.token) unlinkSync(lease.path);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+}
+
+function archiveFrame(value) {
+  const body = Buffer.from(JSON.stringify(value), 'utf8');
+  if (body.length < 2 || body.length > ARCHIVE_FRAME_MAX_BYTES) {
+    body.fill(0);
+    fail(413, 'BACKUP_ENTRY_TOO_LARGE', 'An individual backup entry is too large.');
+  }
+  const prefix = Buffer.allocUnsafe(4);
+  prefix.writeUInt32BE(body.length);
+  return Buffer.concat([prefix, body]);
+}
+
+function rejectUnexpectedFields(input, allowed) {
+  const fields = Object.keys(input).filter((field) => !allowed.has(field));
+  if (fields.length) fail(400, 'UNEXPECTED_FIELD', 'The request contains unsupported fields.', { fields });
+}
 function integerPosition(value) {
   if (value === undefined || value === null) return undefined;
   if (!Number.isInteger(value) || value < 0) fail(400, 'VALIDATION_ERROR', 'position must be a non-negative integer.');
@@ -76,22 +146,37 @@ export class Atlas {
   #closed = false;
   #stagingDir;
   #uploads = new Map();
+  #lease;
+  #lifecycleGeneration = 0;
+  #lifecycleTail = Promise.resolve();
+  #transientKeys = new Set();
 
   constructor({ databasePath = 'data/atlas.sqlite' } = {}) {
-    this.#db = openDatabase(databasePath);
-    this.#stagingDir = databasePath === ':memory:'
-      ? join(tmpdir(), `eidolon-atlas-imports-${randomUUID()}`)
-      : `${resolve(databasePath)}.imports`;
-    rmSync(this.#stagingDir, { recursive: true, force: true });
-    mkdirSync(this.#stagingDir, { recursive: true });
+    this.#lease = acquireDatabaseLease(databasePath);
+    try {
+      this.#db = openDatabase(databasePath);
+      this.#db.prepare('DELETE FROM metadata WHERE key = ?').run(LEGACY_AGENT_KEY);
+      this.#stagingDir = databasePath === ':memory:'
+        ? join(tmpdir(), `eidolon-atlas-imports-${randomUUID()}`)
+        : `${resolve(databasePath)}.imports`;
+      rmSync(this.#stagingDir, { recursive: true, force: true });
+      mkdirSync(this.#stagingDir, { recursive: true });
+    } catch (error) {
+      releaseDatabaseLease(this.#lease);
+      throw error;
+    }
   }
 
   close() {
     if (this.#closed) return;
-    this.lock();
-    this.#db.close();
-    rmSync(this.#stagingDir, { recursive: true, force: true });
-    this.#closed = true;
+    try {
+      this.lock();
+      this.#db.close();
+    } finally {
+      rmSync(this.#stagingDir, { recursive: true, force: true });
+      releaseDatabaseLease(this.#lease);
+      this.#closed = true;
+    }
   }
 
   get database() { return this.#db; }
@@ -102,85 +187,83 @@ export class Atlas {
   }
 
   async setup(passphrase) {
-    if (this.#meta(KEY_CONFIG)) fail(409, 'ALREADY_INITIALIZED', 'Atlas has already been set up.');
-    const salt = randomBytes(16);
-    const parameters = { ...DEFAULT_KDF };
-    const key = await deriveKey(passphrase, salt, parameters);
-    const config = { ...parameters, salt: salt.toString('base64') };
-    const check = makeKeyCheck(key);
-    try {
-      transaction(this.#db, () => {
-        this.#setMeta(KEY_CONFIG, config);
-        this.#setMeta(KEY_CHECK, check);
-      });
-      this.#replaceKey(key);
-      this.#seedKnowledge();
-      return this.status();
-    } catch (error) {
-      key.fill(0);
-      throw error;
-    }
+    return this.#withLifecycle(async (generation) => {
+      if (this.#meta(KEY_CONFIG)) fail(409, 'ALREADY_INITIALIZED', 'Atlas has already been set up.');
+      const salt = randomBytes(16);
+      const parameters = { ...DEFAULT_KDF };
+      const key = await deriveKey(passphrase, salt, parameters);
+      const config = { ...parameters, salt: salt.toString('base64') };
+      const check = makeKeyCheck(key);
+      try {
+        this.#assertLifecycle(generation);
+        transaction(this.#db, () => {
+          if (this.#meta(KEY_CONFIG)) fail(409, 'ALREADY_INITIALIZED', 'Atlas has already been set up.');
+          this.#setMeta(KEY_CONFIG, config);
+          this.#setMeta(KEY_CHECK, check);
+        });
+        this.#advanceLifecycle(generation);
+        this.#replaceKey(key);
+        this.#seedKnowledge();
+        return this.status();
+      } catch (error) {
+        key.fill(0);
+        throw error;
+      }
+    });
   }
 
   async unlock(passphrase) {
-    const config = this.#meta(KEY_CONFIG);
-    const check = this.#meta(KEY_CHECK);
-    if (!config || !check) fail(409, 'NOT_INITIALIZED', 'Atlas must be set up first.');
-    const salt = Buffer.from(config.salt ?? '', 'base64');
-    if (salt.length !== 16) fail(500, 'INVALID_ENCRYPTION_CONFIG', 'Stored encryption configuration is invalid.');
-    const parameters = { ...config };
-    delete parameters.salt;
-    const key = await deriveKey(passphrase, salt, parameters);
-    try {
-      verifyKeyCheck(key, check);
-    } catch (error) {
-      key.fill(0);
-      if (error instanceof AtlasError && error.code === 'DATA_INTEGRITY_ERROR') {
-        fail(401, 'INVALID_PASSPHRASE', 'The passphrase is incorrect.');
-      }
-      throw error;
-    }
-    this.#replaceKey(key);
-    this.#migrateRelationshipKinds();
-    this.#migrateGoalData();
-    this.#seedKnowledge();
-    return this.status();
+    return this.#withLifecycle(async (generation) => {
+      const key = await this.#deriveConfiguredKey(passphrase, generation);
+      this.#advanceLifecycle(generation);
+      this.#replaceKey(key);
+      this.#migrateRelationshipKinds();
+      this.#migrateGoalData();
+      this.#seedKnowledge();
+      return this.status();
+    });
   }
 
   lock() {
-    if (this.#key) this.#key.fill(0);
-    this.#key = null;
+    this.#lifecycleGeneration += 1;
+    this.#lockState();
     return this.status();
   }
 
   async clearAll(passphrase) {
-    this.#requireUnlocked();
-    await this.unlock(passphrase);
+    return this.#withLifecycle(async (generation) => {
+      this.#requireUnlocked();
+      const key = await this.#deriveConfiguredKey(passphrase, generation);
+      key.fill(0);
+      this.#assertLifecycle(generation);
 
-    rmSync(this.#stagingDir, { recursive: true, force: true });
-    mkdirSync(this.#stagingDir, { recursive: true });
-    this.#uploads.clear();
+      rmSync(this.#stagingDir, { recursive: true, force: true });
+      mkdirSync(this.#stagingDir, { recursive: true });
+      this.#uploads.clear();
 
-    transaction(this.#db, () => {
-      this.#db.exec(`
-        DELETE FROM record_images;
-        DELETE FROM goal_dependencies;
-        DELETE FROM links;
-        DELETE FROM record_revisions;
-        DELETE FROM records;
-        DELETE FROM custom_fields;
-        DELETE FROM knowledge_connections;
-        DELETE FROM knowledge_metadata;
-      `);
-      const deleteKnowledgeLeaves = this.#db.prepare(`DELETE FROM knowledge_nodes
-        WHERE NOT EXISTS (SELECT 1 FROM knowledge_nodes child WHERE child.parent_id = knowledge_nodes.id)`);
-      while (this.#db.prepare('SELECT 1 FROM knowledge_nodes LIMIT 1').get()) {
-        if (!deleteKnowledgeLeaves.run().changes) fail(500, 'KNOWLEDGE_INTEGRITY_ERROR', 'Stored knowledge hierarchy could not be cleared.');
-      }
-      this.#db.exec('DELETE FROM metadata;');
+      transaction(this.#db, () => {
+        this.#db.exec(`
+          DELETE FROM record_images;
+          DELETE FROM goal_dependencies;
+          DELETE FROM links;
+          DELETE FROM record_revisions;
+          DELETE FROM records;
+          DELETE FROM custom_fields;
+          DELETE FROM knowledge_connections;
+          DELETE FROM knowledge_metadata;
+        `);
+        const deleteKnowledgeLeaves = this.#db.prepare(`DELETE FROM knowledge_nodes
+          WHERE NOT EXISTS (SELECT 1 FROM knowledge_nodes child WHERE child.parent_id = knowledge_nodes.id)`);
+        while (this.#db.prepare('SELECT 1 FROM knowledge_nodes LIMIT 1').get()) {
+          if (!deleteKnowledgeLeaves.run().changes) fail(500, 'KNOWLEDGE_INTEGRITY_ERROR', 'Stored knowledge hierarchy could not be cleared.');
+        }
+        this.#db.exec('DELETE FROM metadata;');
+      });
+
+      this.#advanceLifecycle(generation);
+      this.#lockState();
+      return this.status();
     });
-
-    return this.lock();
   }
 
   listKnowledgeNodes() {
@@ -221,7 +304,7 @@ export class Atlas {
   createKnowledgeNode(input) {
     this.#requireUnlocked();
     requireObject(input);
-    if (Object.hasOwn(input, 'description')) fail(400, 'UNEXPECTED_FIELD', 'Nodes no longer accept a description field.', { fields: ['description'] });
+    rejectUnexpectedFields(input, new Set(['name', 'branch', 'parentId', 'status', 'understanding', 'terms']));
     const name = normalizeKnowledgeName(input.name);
     const branch = normalizeKnowledgeBranch(input.branch);
     const parentId = input.parentId == null ? null : knowledgeId(input.parentId, 'parentId');
@@ -250,7 +333,7 @@ export class Atlas {
   patchKnowledgeNode(value, input) {
     this.#requireUnlocked();
     requireObject(input);
-    if (Object.hasOwn(input, 'description')) fail(400, 'UNEXPECTED_FIELD', 'Nodes no longer accept a description field.', { fields: ['description'] });
+    rejectUnexpectedFields(input, new Set(['name', 'branch', 'parentId', 'status', 'understanding', 'terms']));
     const id = knowledgeId(value);
     const current = this.getKnowledgeNode(id);
     const name = input.name === undefined ? current.name : normalizeKnowledgeName(input.name);
@@ -326,106 +409,6 @@ export class Atlas {
     const result = this.#db.prepare('DELETE FROM knowledge_connections WHERE id = ?').run(id);
     if (!result.changes) fail(404, 'KNOWLEDGE_CONNECTION_NOT_FOUND', `Connection ${id} does not exist.`);
     return { deleted: true };
-  }
-
-  getAgentKeyStatus() {
-    this.#requireUnlocked();
-    const stored = this.#meta(AGENT_KEY);
-    return stored ? { configured: true, prefix: stored.prefix, createdAt: stored.createdAt }
-      : { configured: false, prefix: null, createdAt: null };
-  }
-
-  generateAgentKey() {
-    this.#requireUnlocked();
-    const token = `atlas_${randomBytes(32).toString('base64url')}`;
-    const createdAt = now();
-    const prefix = token.slice(0, 14);
-    this.#setMeta(AGENT_KEY, { verifier: this.#agentKeyVerifier(token), prefix, createdAt });
-    return { configured: true, prefix, createdAt, key: token };
-  }
-
-  revokeAgentKey() {
-    this.#requireUnlocked();
-    this.#db.prepare('DELETE FROM metadata WHERE key = ?').run(AGENT_KEY);
-    return { revoked: true };
-  }
-
-  verifyAgentKey(token) {
-    const stored = this.#meta(AGENT_KEY);
-    if (!stored || typeof token !== 'string' || !/^atlas_[A-Za-z0-9_-]{43}$/.test(token)) return false;
-    const expected = Buffer.from(stored.verifier ?? '', 'hex');
-    const actual = Buffer.from(this.#agentKeyVerifier(token), 'hex');
-    return expected.length === actual.length && expected.length === 32 && timingSafeEqual(expected, actual);
-  }
-
-  getAgentPersonalInfo() {
-    this.#requireUnlocked();
-    const record = this.listRecords({ category: 'person' })[0];
-    if (!record) return { personal_info: null };
-    const data = record.data ?? {};
-    return { personal_info: {
-      name: record.title,
-      preferred_name: data.preferredName ?? null,
-      gender: data.gender ?? null,
-      birth_date: data.birthDate ?? null,
-      birth_place: data.birthPlace ?? null,
-      nationalities: data.nationalities ?? [],
-      languages: data.languages ?? [],
-      marital_status: data.maritalStatus ?? null,
-      emails: data.emails ?? [],
-      phone_numbers: data.phoneNumbers ?? [],
-      address: data.address ?? null,
-      summary: data.summary ?? null,
-      notes: data.notes ?? null,
-    } };
-  }
-
-  listAgentExperiences() {
-    this.#requireUnlocked();
-    const experiences = this.listRecords({ category: 'experience' })
-      .sort((left, right) => String(right.data?.startDate ?? '').localeCompare(String(left.data?.startDate ?? '')) ||
-        right.createdAt.localeCompare(left.createdAt))
-      .map((record) => ({ title: record.title, time: {
-        start_date: record.data?.startDate ?? null,
-        end_date: record.data?.endDate || null,
-        ongoing: record.data?.ongoing ?? null,
-      }, description: record.data?.narrative ?? null }));
-    return { experiences };
-  }
-
-  getAgentGoals() {
-    this.#requireUnlocked();
-    const records = this.listRecords({ category: 'goal' });
-    const byParent = new Map();
-    for (const goal of records) {
-      const children = byParent.get(goal.parentId) ?? [];
-      children.push(goal); byParent.set(goal.parentId, children);
-    }
-    for (const children of byParent.values()) children.sort((left, right) => left.position - right.position);
-    const build = (goal) => ({ id: goal.id, title: goal.title,
-      description: goal.data?.description ?? null, importance: goal.data?.importance ?? 'medium',
-      horizon: goal.data?.horizon ?? null, target_date: goal.data?.targetDate || null,
-      subgoals: (byParent.get(goal.id) ?? []).map(build) });
-    const progressions = records.filter((goal) => (byParent.get(goal.id) ?? []).length).map((parent) => {
-      const children = byParent.get(parent.id);
-      const ids = new Set(children.map((child) => child.id));
-      const edges = this.#db.prepare(`SELECT goal_id, prerequisite_id FROM goal_dependencies
-        WHERE goal_id IN (SELECT id FROM records WHERE parent_id = ? AND trashed = 0)
-        ORDER BY created_at, goal_id, prerequisite_id`).all(parent.id)
-        .filter((edge) => ids.has(edge.prerequisite_id))
-        .map((edge) => ({ prerequisite_goal_id: edge.prerequisite_id, dependent_goal_id: edge.goal_id }));
-      return { parent_goal_id: parent.id, subgoal_ids: children.map((child) => child.id), edges };
-    });
-    return { goals: (byParent.get(null) ?? []).map(build), progressions };
-  }
-
-  listAgentProjects() {
-    this.#requireUnlocked();
-    const projects = this.listRecords({ category: 'project' }).map((record) => ({
-      title: record.title, description: record.data?.context ?? null, status: record.data?.status ?? null,
-      github_link: record.data?.githubLink || null,
-    })).sort((left, right) => left.title.localeCompare(right.title, 'en-US', { sensitivity: 'base' }));
-    return { projects };
   }
 
   createRecord(input) {
@@ -541,6 +524,64 @@ export class Atlas {
     this.#db.prepare('INSERT INTO goal_dependencies(goal_id, prerequisite_id, created_at) VALUES (?, ?, ?)')
       .run(goal.id, prerequisite.id, createdAt);
     return { goalId: goal.id, prerequisiteId: prerequisite.id, createdAt };
+  }
+
+  createSubgoal(parentId, input) {
+    this.#requireUnlocked();
+    requireObject(input);
+    rejectUnexpectedFields(input, new Set(['requestId', 'title', 'data', 'customFieldValues', 'prerequisiteIds']));
+    if (typeof input.requestId !== 'string' || !UPLOAD_ID.test(input.requestId)) {
+      fail(400, 'VALIDATION_ERROR', 'requestId must be a UUID.');
+    }
+    if (!Array.isArray(input.prerequisiteIds) || input.prerequisiteIds.some((id) => typeof id !== 'string' || !id)) {
+      fail(400, 'VALIDATION_ERROR', 'prerequisiteIds must be an array of goal identifiers.');
+    }
+    const prerequisiteIds = [...new Set(input.prerequisiteIds)].sort();
+    if (prerequisiteIds.length !== input.prerequisiteIds.length) {
+      fail(400, 'VALIDATION_ERROR', 'prerequisiteIds must not contain duplicates.');
+    }
+    const content = normalizeRecord({
+      category: 'goal', title: input.title, data: input.data,
+      customFieldValues: input.customFieldValues ?? {},
+    });
+    const signature = canonicalJson({ parentId, content, prerequisiteIds });
+    const existingRequest = this.#db.prepare('SELECT * FROM subgoal_requests WHERE request_id = ?').get(input.requestId);
+    if (existingRequest) {
+      const stored = decryptJson(this.#key, existingRequest.payload,
+        objectAad('subgoal-request', input.requestId, 1, existingRequest.record_id));
+      if (stored.signature !== signature) {
+        fail(409, 'IDEMPOTENCY_CONFLICT', 'requestId was already used for a different subgoal request.');
+      }
+      return { record: this.getRecord(existingRequest.record_id), created: false };
+    }
+
+    const parent = this.#goalRecord(parentId);
+    if (parent.trashed) fail(409, 'GOAL_TRASHED', 'A removed Goal cannot receive subgoals.');
+    this.#validateCustomValues('goal', content.customFieldValues);
+    const prerequisites = prerequisiteIds.map((id) => this.#goalRecord(id));
+    if (prerequisites.some((goal) => goal.trashed || goal.parentId !== parentId)) {
+      fail(400, 'INVALID_GOAL_DEPENDENCY', 'Every prerequisite must be an active sibling in this progression.');
+    }
+
+    const id = randomUUID();
+    const createdAt = now();
+    const position = this.#insertPosition(parentId, undefined);
+    const snapshot = { ...content, parentId, position, trashed: false };
+    transaction(this.#db, () => {
+      this.#shiftPositions(parentId, position, 1);
+      this.#db.prepare(`INSERT INTO records
+        (id, category, revision, trashed, parent_id, position, created_at, updated_at, payload)
+        VALUES (?, 'goal', 1, 0, ?, ?, ?, ?, ?)`)
+        .run(id, parentId, position, createdAt, createdAt, this.#encryptRecord(id, 1, 'goal', snapshot));
+      this.#insertRevision(id, 1, 'goal', createdAt, snapshot);
+      const insertDependency = this.#db.prepare(`INSERT INTO goal_dependencies
+        (goal_id, prerequisite_id, created_at) VALUES (?, ?, ?)`);
+      for (const prerequisiteId of prerequisiteIds) insertDependency.run(id, prerequisiteId, createdAt);
+      this.#db.prepare(`INSERT INTO subgoal_requests(request_id, record_id, created_at, payload)
+        VALUES (?, ?, ?, ?)`).run(input.requestId, id, createdAt,
+        encryptJson(this.#key, { signature }, objectAad('subgoal-request', input.requestId, 1, id)));
+    });
+    return { record: this.getRecord(id), created: true };
   }
 
   deleteGoalDependency(goalId, prerequisiteId) {
@@ -718,8 +759,18 @@ export class Atlas {
     const existing = this.#customFieldFromRow(row);
     if (existing.archived) fail(409, 'CUSTOM_FIELD_ARCHIVED', 'An archived custom field cannot be changed.');
     const field = normalizeCustomField(input, existing);
+    const duplicate = this.listCustomFields({ category: field.category }).find((item) => item.id !== id &&
+      item.name.normalize('NFKC').toLocaleLowerCase() === field.name.normalize('NFKC').toLocaleLowerCase());
+    if (duplicate) fail(409, 'CUSTOM_FIELD_EXISTS', 'A custom field with that name already exists in the category.');
     for (const record of this.listRecords({ category: field.category, trashed: 'all' })) {
       if (Object.hasOwn(record.customFieldValues, id)) validateCustomFieldValue(field, record.customFieldValues[id]);
+    }
+    for (const revisionRow of this.#db.prepare('SELECT * FROM record_revisions WHERE category = ?').all(field.category)) {
+      const snapshot = decryptJson(this.#key, revisionRow.payload,
+        objectAad('revision', revisionRow.record_id, revisionRow.revision, revisionRow.category));
+      if (Object.hasOwn(snapshot.customFieldValues ?? {}, id)) {
+        validateCustomFieldValue(field, snapshot.customFieldValues[id]);
+      }
     }
     const updatedAt = now();
     const payload = encryptJson(this.#key, { name: field.name, options: field.options },
@@ -865,12 +916,17 @@ export class Atlas {
   }
 
   async export(passphrase) {
-    this.#requireUnlocked();
-    return createBackupEnvelope(passphrase, this.#exportSnapshot());
+    return this.#withLifecycle(async (generation) => {
+      this.#requireUnlocked();
+      const result = await createBackupEnvelope(passphrase, this.#exportSnapshot());
+      this.#assertLifecycle(generation);
+      return result;
+    });
   }
 
   async exportV2(passphrase) {
     this.#requireUnlocked();
+    const generation = this.#lifecycleGeneration;
     const snapshot = this.#exportSnapshot();
     const rows = this.#db.prepare('SELECT * FROM record_images ORDER BY record_id, position, created_at, id').all();
     const images = rows.map((row) => this.#imageFromRow(row));
@@ -881,12 +937,16 @@ export class Atlas {
     const prefix = Buffer.allocUnsafe(4);
     prefix.writeUInt32BE(manifest.length);
     const plaintextLength = 4 + manifest.length + images.reduce((total, image) => total + image.byteLength, 0);
-    const key = Buffer.from(this.#key);
+    const key = this.#copyTransientKey();
+    const atlas = this;
     const plaintext = async function* () {
       try {
+        atlas.#assertLifecycle(generation);
         yield prefix;
+        atlas.#assertLifecycle(generation);
         yield manifest;
         for (let index = 0; index < rows.length; index += 1) {
+          atlas.#assertLifecycle(generation);
           const row = rows[index];
           const bytes = decryptBinary(key, row.content, objectAad('image-content', row.id, 1, row.record_id));
           try {
@@ -900,14 +960,15 @@ export class Atlas {
           }
         }
       } finally {
-        key.fill(0);
+        atlas.#releaseTransientKey(key);
       }
     };
     let result;
     try {
       result = await createBackupV2Stream(passphrase, plaintextLength, plaintext());
+      this.#assertLifecycle(generation);
     } catch (error) {
-      key.fill(0);
+      this.#releaseTransientKey(key);
       throw error;
     }
     return {
@@ -917,14 +978,82 @@ export class Atlas {
     };
   }
 
+  async exportV3(passphrase) {
+    this.#requireUnlocked();
+    const generation = this.#lifecycleGeneration;
+    const snapshot = this.#exportSnapshot();
+    const rows = this.#db.prepare('SELECT * FROM record_images ORDER BY record_id, position, created_at, id').all();
+    const images = rows.map((row) => this.#imageFromRow(row));
+    const key = this.#copyTransientKey();
+    const atlas = this;
+    const emit = async function* (value) {
+      atlas.#assertLifecycle(generation);
+      const frame = archiveFrame(value);
+      try { yield frame; } finally { frame.fill(0); }
+    };
+    const plaintext = async function* () {
+      try {
+        atlas.#assertLifecycle(generation);
+        yield* emit({ type: 'archive', format: 'eidolon-atlas-archive', version: 3, exportedAt: snapshot.exportedAt });
+        for (const value of snapshot.customFields) yield* emit({ type: 'customField', value });
+        for (const value of snapshot.records) yield* emit({ type: 'record', value });
+        for (const value of snapshot.revisions) yield* emit({ type: 'revision', value });
+        for (const value of snapshot.links) yield* emit({ type: 'link', value });
+        for (const value of snapshot.goalDependencies) yield* emit({ type: 'goalDependency', value });
+        for (const value of snapshot.knowledge.nodes) yield* emit({ type: 'knowledgeNode', value });
+        for (const value of snapshot.knowledge.connections) yield* emit({ type: 'knowledgeConnection', value });
+        for (const value of snapshot.knowledge.metadata) yield* emit({ type: 'knowledgeMetadata', value });
+        for (let index = 0; index < rows.length; index += 1) {
+          atlas.#assertLifecycle(generation);
+          const metadata = images[index];
+          yield* emit({ type: 'image', value: metadata });
+          const bytes = decryptBinary(key, rows[index].content,
+            objectAad('image-content', rows[index].id, 1, rows[index].record_id));
+          try {
+            if (bytes.length !== metadata.byteLength || imageType(bytes) !== metadata.mimeType) {
+              fail(422, 'DATA_INTEGRITY_ERROR', 'Encrypted image content does not match its authenticated metadata.');
+            }
+            yield bytes;
+          } finally {
+            bytes.fill(0);
+          }
+        }
+        yield* emit({ type: 'end', counts: {
+          customFields: snapshot.customFields.length, records: snapshot.records.length,
+          revisions: snapshot.revisions.length, links: snapshot.links.length,
+          goalDependencies: snapshot.goalDependencies.length, knowledgeNodes: snapshot.knowledge.nodes.length,
+          knowledgeConnections: snapshot.knowledge.connections.length,
+          knowledgeMetadata: snapshot.knowledge.metadata.length, images: images.length,
+        } });
+        atlas.#assertLifecycle(generation);
+      } finally {
+        atlas.#releaseTransientKey(key);
+      }
+    };
+    try {
+      const result = await createBackupV3Stream(passphrase, plaintext());
+      this.#assertLifecycle(generation);
+      return {
+        ...result,
+        contentType: 'application/vnd.eidolon-atlas-backup',
+        filename: `eidolon-atlas-${now().slice(0, 10)}.atlas`,
+      };
+    } catch (error) {
+      this.#releaseTransientKey(key);
+      throw error;
+    }
+  }
+
   async stageImportUpload(source, { maxBytes = BACKUP_UPLOAD_MAX_BYTES } = {}) {
     this.#requireUnlocked();
+    const generation = this.#lifecycleGeneration;
     const id = randomUUID();
     const path = this.#uploadPath(id);
     const handle = await open(path, 'wx', 0o600);
     let byteLength = 0;
     try {
       for await (const value of source) {
+        this.#assertLifecycle(generation);
         const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
         byteLength += chunk.length;
         if (byteLength > maxBytes) fail(413, 'REQUEST_TOO_LARGE', `Backup upload exceeds the ${maxBytes}-byte limit.`);
@@ -937,6 +1066,7 @@ export class Atlas {
       }
       if (byteLength === 0) fail(400, 'INVALID_BACKUP', 'The backup upload is empty.');
       await handle.sync();
+      this.#assertLifecycle(generation);
     } catch (error) {
       await handle.close().catch(() => {});
       await rm(path, { force: true }).catch(() => {});
@@ -956,27 +1086,35 @@ export class Atlas {
   }
 
   async commitImportUpload(id, passphrase) {
-    this.#requireUnlocked();
-    this.#requireUpload(id);
-    const path = this.#uploadPath(id);
-    const stagedImages = [];
-    try {
-      const { prepared, images } = await this.#openV2Upload(path, passphrase, stagedImages);
-      this.#replaceSnapshot(prepared, images);
-      return { imported: true, records: prepared.records.length, images: images.length };
-    } finally {
-      this.#uploads.delete(id);
-      await rm(path, { force: true }).catch(() => {});
-      await Promise.all(stagedImages.map((image) => rm(image.path, { force: true }).catch(() => {})));
-    }
+    return this.#withLifecycle(async (generation) => {
+      this.#requireUnlocked();
+      this.#requireUpload(id);
+      const path = this.#uploadPath(id);
+      const stagedImages = [];
+      try {
+        const { prepared, images } = await this.#openBackupUpload(path, passphrase, stagedImages, generation);
+        this.#assertLifecycle(generation);
+        this.#replaceSnapshot(prepared, images);
+        this.#advanceLifecycle(generation);
+        return { imported: true, records: prepared.records.length, images: images.length };
+      } finally {
+        this.#uploads.delete(id);
+        await rm(path, { force: true }).catch(() => {});
+        await Promise.all(stagedImages.map((image) => rm(image.path, { force: true }).catch(() => {})));
+      }
+    });
   }
 
   async import(passphrase, envelope) {
-    this.#requireUnlocked();
-    const snapshot = await openBackupEnvelope(passphrase, envelope);
-    const prepared = this.#validateSnapshot(snapshot);
-    this.#replaceSnapshot(prepared, []);
-    return { imported: true, records: prepared.records.length };
+    return this.#withLifecycle(async (generation) => {
+      this.#requireUnlocked();
+      const snapshot = await openBackupEnvelope(passphrase, envelope);
+      this.#assertLifecycle(generation);
+      const prepared = this.#validateSnapshot(snapshot);
+      this.#replaceSnapshot(prepared, []);
+      this.#advanceLifecycle(generation);
+      return { imported: true, records: prepared.records.length };
+    });
   }
 
   #replaceSnapshot(prepared, images) {
@@ -1069,7 +1207,237 @@ export class Atlas {
     };
   }
 
-  async #openV2Upload(path, passphrase, stagedImages) {
+  async #openBackupUpload(path, passphrase, stagedImages, generation) {
+    const handle = await open(path, 'r');
+    const magic = Buffer.alloc(BACKUP_V2_MAGIC.length);
+    try {
+      if ((await handle.read(magic, 0, magic.length, 0)).bytesRead !== magic.length) {
+        fail(400, 'INVALID_BACKUP', 'The backup container is truncated.');
+      }
+    } finally {
+      await handle.close();
+    }
+    if (magic.equals(BACKUP_V3_MAGIC)) return this.#openV3Upload(path, passphrase, stagedImages, generation);
+    if (magic.equals(BACKUP_V2_MAGIC)) return this.#openV2Upload(path, passphrase, stagedImages, generation);
+    fail(400, 'INVALID_BACKUP', 'The backup is not a supported container.');
+  }
+
+  async #openV3Upload(path, passphrase, stagedImages, generation) {
+    const handle = await open(path, 'r');
+    let size;
+    let prefix;
+    let tag;
+    try {
+      size = (await handle.stat()).size;
+      const preludeLength = BACKUP_V3_MAGIC.length + 4;
+      if (size < preludeLength + 2 + 16) fail(400, 'INVALID_BACKUP', 'The v3 backup is truncated.');
+      const prelude = Buffer.alloc(preludeLength);
+      if ((await handle.read(prelude, 0, prelude.length, 0)).bytesRead !== prelude.length ||
+          !prelude.subarray(0, BACKUP_V3_MAGIC.length).equals(BACKUP_V3_MAGIC)) {
+        fail(400, 'INVALID_BACKUP', 'The backup is not a supported v3 container.');
+      }
+      const headerLength = prelude.readUInt32BE(BACKUP_V3_MAGIC.length);
+      if (headerLength < 2 || headerLength > BACKUP_V2_MAX_HEADER_BYTES || size < preludeLength + headerLength + 16 + 6) {
+        fail(400, 'INVALID_BACKUP', 'The v3 backup header is invalid or the backup is truncated.');
+      }
+      prefix = Buffer.alloc(preludeLength + headerLength);
+      prelude.copy(prefix);
+      if ((await handle.read(prefix, preludeLength, headerLength, preludeLength)).bytesRead !== headerLength) {
+        fail(400, 'INVALID_BACKUP', 'The v3 backup header is truncated.');
+      }
+      tag = Buffer.alloc(16);
+      if ((await handle.read(tag, 0, 16, size - 16)).bytesRead !== 16) fail(400, 'INVALID_BACKUP', 'The v3 backup tag is truncated.');
+    } finally {
+      await handle.close();
+    }
+
+    const { decipher, key, tagBytes } = await createBackupV3Decipher(passphrase, prefix);
+    decipher.setAuthTag(tag);
+    try { this.#assertLifecycle(generation); } catch (error) { key.fill(0); throw error; }
+    const localKey = this.#copyTransientKey();
+    const snapshot = {
+      format: 'eidolon-atlas-snapshot', version: 1, exportedAt: null,
+      records: [], revisions: [], customFields: [], links: [], goalDependencies: [],
+      knowledge: { nodes: [], connections: [], metadata: [] },
+    };
+    const images = [];
+    let started = false;
+    let ended = false;
+    let lengthBytes = Buffer.alloc(4);
+    let lengthSeen = 0;
+    let frameLength;
+    let frameSeen = 0;
+    let frameChunks = [];
+    let rawImage = null;
+    let rawSeen = 0;
+    let rawChunks = [];
+    let parseError;
+
+    const finishImage = async () => {
+      const bytes = Buffer.concat(rawChunks, rawSeen);
+      rawChunks = [];
+      rawSeen = 0;
+      try {
+        if (bytes.length !== rawImage.byteLength || imageType(bytes) !== rawImage.mimeType) {
+          fail(400, 'INVALID_BACKUP', 'Backup image bytes do not match their authenticated metadata.');
+        }
+        const encrypted = encryptBinary(localKey, bytes,
+          objectAad('image-content', rawImage.id, 1, rawImage.recordId));
+        const imagePath = join(this.#stagingDir, `image-${randomUUID()}.encrypted`);
+        try {
+          await writeFile(imagePath, encrypted, { flag: 'wx', mode: 0o600 });
+          stagedImages.push({ ...rawImage, path: imagePath });
+        } finally {
+          encrypted.fill(0);
+        }
+      } finally {
+        bytes.fill(0);
+      }
+      rawImage = null;
+    };
+
+    const acceptFrame = (frame) => {
+      if (!frame || typeof frame.type !== 'string') fail(400, 'INVALID_BACKUP', 'A v3 backup frame is invalid.');
+      if (!started) {
+        if (frame.type !== 'archive' || frame.format !== 'eidolon-atlas-archive' || frame.version !== 3 ||
+            typeof frame.exportedAt !== 'string') {
+          fail(400, 'INVALID_BACKUP', 'The v3 archive header frame is invalid.');
+        }
+        started = true;
+        snapshot.exportedAt = frame.exportedAt;
+        return;
+      }
+      if (ended) fail(400, 'INVALID_BACKUP', 'The v3 backup contains data after its end frame.');
+      const targets = {
+        customField: snapshot.customFields, record: snapshot.records, revision: snapshot.revisions,
+        link: snapshot.links, goalDependency: snapshot.goalDependencies,
+        knowledgeNode: snapshot.knowledge.nodes, knowledgeConnection: snapshot.knowledge.connections,
+        knowledgeMetadata: snapshot.knowledge.metadata,
+      };
+      if (targets[frame.type]) {
+        targets[frame.type].push(frame.value);
+        return;
+      }
+      if (frame.type === 'image') {
+        const image = frame.value;
+        if (!image || typeof image.id !== 'string' || typeof image.recordId !== 'string' ||
+            typeof image.createdAt !== 'string' || integerPosition(image.position) === undefined) {
+          fail(400, 'INVALID_BACKUP', 'An image has invalid structural metadata.');
+        }
+        validateImageMetadata(image, { backup: true });
+        images.push(image);
+        rawImage = image;
+        return;
+      }
+      if (frame.type === 'end') {
+        const counts = frame.counts;
+        const expected = {
+          customFields: snapshot.customFields.length, records: snapshot.records.length,
+          revisions: snapshot.revisions.length, links: snapshot.links.length,
+          goalDependencies: snapshot.goalDependencies.length, knowledgeNodes: snapshot.knowledge.nodes.length,
+          knowledgeConnections: snapshot.knowledge.connections.length,
+          knowledgeMetadata: snapshot.knowledge.metadata.length, images: images.length,
+        };
+        if (canonicalJson(counts) !== canonicalJson(expected)) {
+          fail(400, 'INVALID_BACKUP', 'The v3 backup end-frame counts do not match its contents.');
+        }
+        ended = true;
+        return;
+      }
+      fail(400, 'INVALID_BACKUP', 'The v3 backup contains an unsupported frame type.');
+    };
+
+    const consume = async (plaintext) => {
+      let offset = 0;
+      while (offset < plaintext.length) {
+        if (rawImage) {
+          const take = Math.min(rawImage.byteLength - rawSeen, plaintext.length - offset);
+          rawChunks.push(Buffer.from(plaintext.subarray(offset, offset + take)));
+          rawSeen += take;
+          offset += take;
+          if (rawSeen === rawImage.byteLength) await finishImage();
+          continue;
+        }
+        if (lengthSeen < 4) {
+          const take = Math.min(4 - lengthSeen, plaintext.length - offset);
+          plaintext.copy(lengthBytes, lengthSeen, offset, offset + take);
+          lengthSeen += take;
+          offset += take;
+          if (lengthSeen === 4) {
+            frameLength = lengthBytes.readUInt32BE(0);
+            if (frameLength < 2 || frameLength > ARCHIVE_FRAME_MAX_BYTES) {
+              fail(400, 'INVALID_BACKUP', 'A v3 backup frame length is invalid.');
+            }
+          }
+          continue;
+        }
+        const take = Math.min(frameLength - frameSeen, plaintext.length - offset);
+        frameChunks.push(Buffer.from(plaintext.subarray(offset, offset + take)));
+        frameSeen += take;
+        offset += take;
+        if (frameSeen === frameLength) {
+          const frameBytes = Buffer.concat(frameChunks, frameLength);
+          frameChunks = [];
+          let frame;
+          try {
+            frame = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(frameBytes));
+          } catch {
+            fail(400, 'INVALID_BACKUP', 'A v3 backup frame is not valid JSON.');
+          } finally {
+            frameBytes.fill(0);
+          }
+          lengthSeen = 0;
+          frameLength = undefined;
+          frameSeen = 0;
+          acceptFrame(frame);
+        }
+      }
+    };
+
+    try {
+      const ciphertextEnd = size - tagBytes - 1;
+      for await (const chunk of createReadStream(path, { start: prefix.length, end: ciphertextEnd })) {
+        this.#assertLifecycle(generation);
+        const plaintext = decipher.update(chunk);
+        try {
+          if (!parseError) await consume(plaintext);
+        } catch (error) {
+          parseError = error;
+        } finally {
+          plaintext.fill(0);
+        }
+      }
+      let final;
+      try {
+        final = decipher.final();
+      } catch {
+        fail(401, 'INVALID_BACKUP_PASSPHRASE', 'The backup passphrase is incorrect or the backup was modified.');
+      }
+      try {
+        if (!parseError) await consume(final);
+      } catch (error) {
+        parseError = error;
+      } finally {
+        final.fill(0);
+      }
+      if (parseError) throw parseError;
+      if (!started || !ended || rawImage || lengthSeen !== 0 || frameSeen !== 0) {
+        fail(400, 'INVALID_BACKUP', 'The v3 backup archive is truncated.');
+      }
+      const { prepared } = this.#validateV2Manifest({
+        format: 'eidolon-atlas-archive', version: 3, snapshot, images,
+      });
+      return { prepared, images: stagedImages };
+    } finally {
+      key.fill(0);
+      this.#releaseTransientKey(localKey);
+      lengthBytes.fill(0);
+      for (const chunk of frameChunks) chunk.fill(0);
+      for (const chunk of rawChunks) chunk.fill(0);
+    }
+  }
+
+  async #openV2Upload(path, passphrase, stagedImages, generation) {
     const handle = await open(path, 'r');
     let size;
     let prefix;
@@ -1100,7 +1468,8 @@ export class Atlas {
 
     const { decipher, key, tagBytes } = await createBackupV2Decipher(passphrase, prefix);
     decipher.setAuthTag(tag);
-    const localKey = Buffer.from(this.#key);
+    try { this.#assertLifecycle(generation); } catch (error) { key.fill(0); throw error; }
+    const localKey = this.#copyTransientKey();
     let prepared;
     let images;
     let lengthBytes = Buffer.alloc(4);
@@ -1186,6 +1555,7 @@ export class Atlas {
     try {
       const ciphertextEnd = size - tagBytes - 1;
       for await (const chunk of createReadStream(path, { start: prefix.length, end: ciphertextEnd })) {
+        this.#assertLifecycle(generation);
         const plaintext = decipher.update(chunk);
         try {
           if (!parseError) await consume(plaintext);
@@ -1215,7 +1585,7 @@ export class Atlas {
       return { prepared, images: stagedImages };
     } finally {
       key.fill(0);
-      localKey.fill(0);
+      this.#releaseTransientKey(localKey);
       lengthBytes.fill(0);
       for (const chunk of manifestChunks) chunk.fill(0);
       for (const chunk of imageChunks) chunk.fill(0);
@@ -1223,8 +1593,8 @@ export class Atlas {
   }
 
   #validateV2Manifest(manifest) {
-    if (!manifest || manifest.format !== 'eidolon-atlas-archive' || manifest.version !== 2 || !Array.isArray(manifest.images)) {
-      fail(400, 'INVALID_BACKUP', 'The v2 backup manifest is invalid or unsupported.');
+    if (!manifest || manifest.format !== 'eidolon-atlas-archive' || ![2, 3].includes(manifest.version) || !Array.isArray(manifest.images)) {
+      fail(400, 'INVALID_BACKUP', 'The backup archive manifest is invalid or unsupported.');
     }
     const prepared = this.#validateSnapshot(manifest.snapshot);
     const records = new Map(prepared.records.map((record) => [record.id, record]));
@@ -1346,25 +1716,32 @@ export class Atlas {
       if (parentId !== null && (!byId.has(parentId) || byId.get(parentId).category !== 'goal')) {
         fail(400, 'INVALID_BACKUP', 'A goal revision has an invalid parent.');
       }
+      for (const [fieldId, value] of Object.entries(normalized.customFieldValues)) {
+        const definition = fieldMap.get(fieldId);
+        if (!definition) fail(400, 'INVALID_BACKUP', 'A revision references a missing custom field.');
+        if (definition.category !== normalized.category) fail(400, 'INVALID_BACKUP', 'A custom field is used by the wrong revision category.');
+        validateCustomFieldValue(definition, value);
+      }
       return { ...revision, snapshot: { ...normalized, parentId: revision.snapshot.parentId ?? null,
         position: integerPosition(revision.snapshot.position) ?? 0, trashed: Boolean(revision.snapshot.trashed) } };
     });
-    const revisionKeys = new Set();
+    const revisionGroups = new Map();
     for (const revision of revisions) {
-      const key = `${revision.recordId}:${revision.revision}`;
-      if (revisionKeys.has(key)) fail(400, 'INVALID_BACKUP', 'The backup contains duplicate revisions.');
-      revisionKeys.add(key);
+      const recordRevisions = revisionGroups.get(revision.recordId) ?? new Map();
+      if (recordRevisions.has(revision.revision)) fail(400, 'INVALID_BACKUP', 'The backup contains duplicate revisions.');
+      recordRevisions.set(revision.revision, revision);
+      revisionGroups.set(revision.recordId, recordRevisions);
     }
     for (const record of records) {
-      if (!revisionKeys.has(`${record.id}:${record.revision}`)) fail(400, 'INVALID_BACKUP', 'A current record revision is missing from history.');
-      const currentRevision = revisions.find((revision) => revision.recordId === record.id && revision.revision === record.revision);
+      const recordRevisions = revisionGroups.get(record.id);
+      const currentRevision = recordRevisions?.get(record.revision);
+      if (!currentRevision) fail(400, 'INVALID_BACKUP', 'A current record revision is missing from history.');
       if (canonicalJson(currentRevision.snapshot) !== canonicalJson(this.#snapshotFromRecord(record))) {
         fail(400, 'INVALID_BACKUP', 'A current record does not match its current revision.');
       }
-      const recordRevisions = revisions.filter((revision) => revision.recordId === record.id)
-        .map((revision) => revision.revision).sort((left, right) => left - right);
-      if (recordRevisions.length !== record.revision ||
-          recordRevisions.some((value, index) => value !== index + 1)) {
+      const revisionNumbers = [...recordRevisions.keys()].sort((left, right) => left - right);
+      if (revisionNumbers.length !== record.revision ||
+          revisionNumbers.some((value, index) => value !== index + 1)) {
         fail(400, 'INVALID_BACKUP', 'Record revision history must be complete and contiguous.');
       }
     }
@@ -1737,10 +2114,6 @@ export class Atlas {
       encryptJson(this.#key, { value }, objectAad('knowledge-metadata', key, 1, 'knowledge')));
   }
 
-  #agentKeyVerifier(token) {
-    return createHash('sha256').update(token, 'utf8').digest('hex');
-  }
-
   #meta(key) {
     const row = this.#db.prepare('SELECT value FROM metadata WHERE key = ?').get(key);
     if (!row) return null;
@@ -1750,6 +2123,71 @@ export class Atlas {
   #setMeta(key, value) {
     this.#db.prepare('INSERT INTO metadata(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value')
       .run(key, JSON.stringify(value));
+  }
+
+  async #withLifecycle(operation) {
+    const previous = this.#lifecycleTail;
+    let release;
+    this.#lifecycleTail = new Promise((resolvePromise) => { release = resolvePromise; });
+    await previous;
+    try {
+      if (this.#closed) fail(409, 'ATLAS_CLOSED', 'This Atlas instance is closed.');
+      return await operation(this.#lifecycleGeneration);
+    } finally {
+      release();
+    }
+  }
+
+  #assertLifecycle(generation) {
+    if (generation !== this.#lifecycleGeneration) {
+      fail(409, 'LIFECYCLE_CHANGED', 'Atlas lifecycle state changed while the operation was running.');
+    }
+  }
+
+  #advanceLifecycle(generation) {
+    this.#assertLifecycle(generation);
+    this.#lifecycleGeneration += 1;
+  }
+
+  async #deriveConfiguredKey(passphrase, generation) {
+    const config = this.#meta(KEY_CONFIG);
+    const check = this.#meta(KEY_CHECK);
+    if (!config || !check) fail(409, 'NOT_INITIALIZED', 'Atlas must be set up first.');
+    const salt = Buffer.from(config.salt ?? '', 'base64');
+    if (salt.length !== 16) fail(500, 'INVALID_ENCRYPTION_CONFIG', 'Stored encryption configuration is invalid.');
+    const parameters = { ...config };
+    delete parameters.salt;
+    const key = await deriveKey(passphrase, salt, parameters);
+    try {
+      this.#assertLifecycle(generation);
+      verifyKeyCheck(key, check);
+      return key;
+    } catch (error) {
+      key.fill(0);
+      if (error instanceof AtlasError && error.code === 'DATA_INTEGRITY_ERROR') {
+        fail(401, 'INVALID_PASSPHRASE', 'The passphrase is incorrect.');
+      }
+      throw error;
+    }
+  }
+
+  #copyTransientKey() {
+    this.#requireUnlocked();
+    const key = Buffer.from(this.#key);
+    this.#transientKeys.add(key);
+    return key;
+  }
+
+  #releaseTransientKey(key) {
+    key.fill(0);
+    this.#transientKeys.delete(key);
+  }
+
+  #lockState() {
+    if (this.#key) this.#key.fill(0);
+    this.#key = null;
+    for (const key of this.#transientKeys) key.fill(0);
+    this.#transientKeys.clear();
   }
 
   #replaceKey(key) {

@@ -35,7 +35,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: .5; }
 button, input, textarea, select { outline: none; }
-:focus-visible { outline: 3px solid rgba(155, 88, 59, .26); outline-offset: 2px; }
+:focus-visible { outline: 3px solid var(--copper-dark); outline-offset: 2px; }
 [hidden] { display: none !important; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
 .skip-link { position: fixed; left: 1rem; top: -5rem; z-index: 100; padding: .75rem 1rem; border-radius: 8px; color: white; background: var(--copper-dark); transition: top .2s; }
@@ -502,17 +502,6 @@ button, input, textarea, select { outline: none; }
 .knowledge-node-meta strong { font-family: Georgia,serif; font-size: .9rem; font-weight: 500; }
 .knowledge-node-actions { display: flex; gap: .55rem; flex-wrap: wrap; padding-top: .5rem; }
 
-.agent-key-state { display: flex; gap: .7rem; align-items: center; padding: .9rem; border: 1px solid var(--line); border-radius: 11px; background: rgba(255,255,255,.35); }
-.agent-key-state > span { display: grid; width: 35px; height: 35px; flex: 0 0 auto; place-items: center; border-radius: 9px; color: var(--ink-faint); background: rgba(138,141,130,.1); }
-.agent-key-state.configured > span { color: var(--sage); background: rgba(102,119,99,.11); }
-.agent-key-state svg { width: 16px; }
-.agent-key-state strong { font-family: Georgia,serif; font-size: .95rem; font-weight: 600; }
-.agent-key-state p { margin: .2rem 0 0; color: var(--ink-faint); font-size: .67rem; }
-.agent-key-secret { display: grid; gap: .75rem; padding: .9rem; border: 1px solid rgba(155,88,59,.24); border-radius: 11px; background: rgba(234,210,194,.22); }
-.agent-key-secret .microcopy { text-align: left; }
-.agent-discovery-copy { margin: 0; font-size: .72rem; line-height: 1.55; }
-.agent-discovery-copy code { color: var(--copper-dark); }
-
 .settings-page { display: grid; gap: clamp(2rem,5vw,4rem); animation: fade-slide .42s var(--ease) both; }
 .settings-grid { display: grid; grid-template-columns: minmax(0,1fr); gap: .9rem; }
 .settings-card { display: grid; min-width: 0; grid-template-columns: auto minmax(0,1fr) auto; gap: 1rem; align-items: start; padding: 1.2rem; border: 1px solid var(--line); border-radius: var(--radius); background: rgba(252,249,242,.58); box-shadow: var(--shadow-sm); }
@@ -526,8 +515,6 @@ button, input, textarea, select { outline: none; }
 .settings-card-copy > p:last-of-type { max-width: 620px; margin: .45rem 0 0; color: var(--ink-soft); font-size: .77rem; line-height: 1.55; }
 .settings-card-action { display: flex; gap: .65rem; align-items: center; justify-content: flex-end; }
 .settings-count { display: grid; min-width: 34px; height: 34px; padding: 0 .55rem; place-items: center; border-radius: 20px; color: var(--copper-dark); background: rgba(155,88,59,.09); font-size: .76rem; font-weight: 750; font-variant-numeric: tabular-nums; }
-.settings-agent-card .agent-key-status, .settings-agent-card .agent-key-secret { margin-top: 1rem; }
-.settings-agent-actions { align-self: center; }
 .settings-api { display: grid; gap: 1.2rem; }
 .settings-api + .settings-api { padding-top: clamp(1.5rem,3vw,2.5rem); border-top: 1px solid var(--line); }
 .settings-section-head { display: flex; gap: 1.5rem; align-items: flex-end; justify-content: space-between; padding-bottom: .25rem; }
@@ -603,7 +590,7 @@ button, input, textarea, select { outline: none; }
 @media (max-width: 560px) {
   .button-label { display: none; }
   .view-heading { align-items: flex-start; }
-  .view-heading .heading-actions > .button { display: none; }
+  .view-heading .heading-actions > #new-record { display: none; }
   .view-heading h1 { font-size: 2.25rem; }
   .view-description { font-size: .78rem; }
   .card-grid { grid-template-columns: 1fr; }

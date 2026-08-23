@@ -4,6 +4,8 @@ data/
 *.sqlite-shm
 *.sqlite-wal
 *.atlas.json
+*.atlas
+*.atlas.lock
 coverage/
 .DS_Store
 Thumbs.db

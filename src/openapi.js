@@ -19,290 +19,6 @@ const jsonResponse = (description, schema) => ({
   content: { 'application/json': { schema } },
 });
 
-const emptyRequest = {
-  required: true,
-  content: {
-    'application/json': {
-      schema: { $ref: '#/components/schemas/EmptyObject' },
-    },
-  },
-};
-
-const secured = (operation) => ({ ...operation, security: [{ bearerAuth: [] }] });
-
-const personalInfo = {
-  type: ['object', 'null'],
-  additionalProperties: false,
-  required: [
-    'name', 'preferred_name', 'gender', 'birth_date', 'birth_place', 'nationalities',
-    'languages', 'marital_status', 'emails', 'phone_numbers', 'address', 'summary', 'notes',
-  ],
-  description: 'Stable snake_case built-in Person fields only; sensitive identifiers, custom fields, links, revisions, and metadata are excluded.',
-  properties: {
-    name: { type: 'string' },
-    preferred_name: { type: ['string', 'null'] },
-    gender: { type: ['string', 'null'] },
-    birth_date: { type: ['string', 'null'] },
-    birth_place: { type: ['string', 'null'] },
-    nationalities: { type: 'array', items: { type: 'string' } },
-    languages: { type: 'array', items: { type: 'string' } },
-    marital_status: { type: ['string', 'null'] },
-    emails: { type: 'array', items: { type: 'string' } },
-    phone_numbers: { type: 'array', items: { type: 'string' } },
-    address: { type: ['string', 'null'] },
-    summary: { type: ['string', 'null'] },
-    notes: { type: ['string', 'null'] },
-  },
-};
-
-const experience = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['title', 'time', 'description'],
-  properties: {
-    title: { type: 'string' },
-    time: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['start_date', 'end_date', 'ongoing'],
-      properties: {
-        start_date: { type: ['string', 'null'], description: 'YYYY, YYYY-MM, or YYYY-MM-DD.' },
-        end_date: { type: ['string', 'null'], description: 'YYYY, YYYY-MM, or YYYY-MM-DD.' },
-        ongoing: { type: ['boolean', 'null'] },
-      },
-    },
-    description: { type: ['string', 'null'] },
-  },
-};
-
-const goal = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['id', 'title', 'description', 'importance', 'horizon', 'target_date', 'subgoals'],
-  properties: {
-    id: { type: 'string' },
-    title: { type: 'string' },
-    description: { type: ['string', 'null'] },
-    importance: { type: 'string', enum: ['low', 'medium', 'high'] },
-    horizon: { type: ['string', 'null'], enum: ['short', 'middle', 'long', null] },
-    target_date: { type: ['string', 'null'] },
-    subgoals: { type: 'array', items: { $ref: '#/components/schemas/Goal' } },
-  },
-};
-
-const progression = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['parent_goal_id', 'subgoal_ids', 'edges'],
-  properties: {
-    parent_goal_id: { type: 'string' },
-    subgoal_ids: { type: 'array', items: { type: 'string' } },
-    edges: {
-      type: 'array',
-      items: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['prerequisite_goal_id', 'dependent_goal_id'],
-        properties: {
-          prerequisite_goal_id: { type: 'string' },
-          dependent_goal_id: { type: 'string' },
-        },
-      },
-    },
-  },
-};
-
-const project = {
-  type: 'object',
-  additionalProperties: false,
-  required: ['title', 'description', 'status', 'github_link'],
-  properties: {
-    title: { type: 'string' },
-    description: { type: ['string', 'null'] },
-    status: { type: ['string', 'null'], enum: ['planned', 'active', 'paused', 'completed', 'abandoned', null] },
-    github_link: { type: ['string', 'null'], format: 'uri' },
-  },
-};
-
-export const OPENAPI_SPEC = Object.freeze({
-  openapi: '3.1.0',
-  info: {
-    title: 'Eidolon-Atlas Agent API',
-    version: '1.0.0',
-    summary: 'Authenticated, read-only views of an unlocked personal Atlas.',
-    description: 'The agent API is stateless and intentionally narrow. Every operation returns an explicit projection and accepts an empty JSON object; it never mutates Atlas data.',
-  },
-  servers: [{ url: '/', description: 'The same local Eidolon-Atlas server.' }],
-  security: [{ bearerAuth: [] }],
-  tags: [
-    { name: 'Discovery', description: 'Machine-readable agent catalog, guide, and OpenAPI specification.' },
-    { name: 'Agent', description: 'Authenticated, read-only projections.' },
-  ],
-  'x-agent-guide': '/api/agent/guide',
-  paths: {
-    '/api/openapi.json': {
-      get: secured({
-        operationId: 'get_openapi_specification',
-        tags: ['Discovery'],
-        summary: 'Get the authenticated OpenAPI specification',
-        description: 'Returns the machine-readable contract for the authenticated Agent API. The separate unlocked-browser Knowledge API is intentionally excluded.',
-        responses: { 200: jsonResponse('OpenAPI 3.1 document.', { type: 'object' }), 401: errorResponse, 423: errorResponse },
-      }),
-    },
-    '/api/agent/guide': {
-      get: secured({
-        operationId: 'get_agent_guide',
-        tags: ['Discovery'],
-        summary: 'Get agent privacy and response semantics',
-        description: 'Returns structured guidance for authentication, privacy boundaries, field projections, ordering, hierarchy, and mutation limits.',
-        responses: { 200: jsonResponse('Machine-readable agent guide.', { $ref: '#/components/schemas/AgentGuide' }), 401: errorResponse, 423: errorResponse },
-      }),
-    },
-    '/api/agent/tools': {
-      get: secured({
-        operationId: 'list_agent_tools',
-        tags: ['Discovery'],
-        summary: 'List authenticated agent operations',
-        description: 'Returns the callable Agent tool catalog with each operation name, endpoint, method, description, and input schema.',
-        responses: { 200: jsonResponse('Agent discovery catalog.', { $ref: '#/components/schemas/AgentToolCatalog' }), 401: errorResponse, 423: errorResponse },
-      }),
-    },
-    '/api/agent/get_personal_info': {
-      post: secured({
-        operationId: 'get_personal_info',
-        tags: ['Agent'],
-        summary: 'Return non-sensitive personal information',
-        description: 'Returns the active Person projection using only documented non-sensitive built-in fields, or null when no active Person exists.',
-        requestBody: emptyRequest,
-        responses: {
-          200: jsonResponse('Personal projection.', { $ref: '#/components/schemas/PersonalInfoResponse' }),
-          400: errorResponse, 401: errorResponse, 423: errorResponse,
-        },
-      }),
-    },
-    '/api/agent/list_experiences': {
-      post: secured({
-        operationId: 'list_experiences',
-        tags: ['Agent'],
-        summary: 'List active experiences newest first',
-        description: 'Returns active, non-trashed Experience projections ordered newest first, with partial-date time ranges preserved.',
-        requestBody: emptyRequest,
-        responses: {
-          200: jsonResponse('Experience projections.', { $ref: '#/components/schemas/ExperiencesResponse' }),
-          400: errorResponse, 401: errorResponse, 423: errorResponse,
-        },
-      }),
-    },
-    '/api/agent/get_goals': {
-      post: secured({
-        operationId: 'get_goals',
-        tags: ['Agent'],
-        summary: 'Return the goal hierarchy and sibling prerequisite DAG',
-        description: 'A progression edge points from prerequisite_goal_id to dependent_goal_id; both are sibling subgoals of the listed parent.',
-        requestBody: emptyRequest,
-        responses: {
-          200: jsonResponse('Goal hierarchy and progression projections.', { $ref: '#/components/schemas/GoalsResponse' }),
-          400: errorResponse, 401: errorResponse, 423: errorResponse,
-        },
-      }),
-    },
-    '/api/agent/list_projects': {
-      post: secured({
-        operationId: 'list_projects',
-        tags: ['Agent'],
-        summary: 'List active projects alphabetically',
-        description: 'Returns active, non-trashed Project projections alphabetically with descriptions, lifecycle statuses, and GitHub links.',
-        requestBody: emptyRequest,
-        responses: {
-          200: jsonResponse('Project projections.', { $ref: '#/components/schemas/ProjectsResponse' }),
-          400: errorResponse, 401: errorResponse, 423: errorResponse,
-        },
-      }),
-    },
-  },
-  components: {
-    securitySchemes: {
-      bearerAuth: {
-        type: 'http',
-        scheme: 'bearer',
-        bearerFormat: 'atlas_…',
-        description: 'Local API key generated through POST /api/agent-key. Send it as Authorization: Bearer <key>.',
-      },
-    },
-    schemas: {
-      EmptyObject: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {},
-        description: 'Every read operation accepts only an empty JSON object.',
-      },
-      Error: errorSchema,
-      ErrorResponse: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['error'],
-        properties: { error: { $ref: '#/components/schemas/Error' } },
-      },
-      PersonalInfoResponse: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['personal_info'],
-        properties: { personal_info: { $ref: '#/components/schemas/PersonalInfo' } },
-      },
-      PersonalInfo: personalInfo,
-      ExperiencesResponse: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['experiences'],
-        properties: { experiences: { type: 'array', items: { $ref: '#/components/schemas/Experience' } } },
-      },
-      Experience: experience,
-      GoalsResponse: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['goals', 'progressions'],
-        properties: {
-          goals: { type: 'array', items: { $ref: '#/components/schemas/Goal' } },
-          progressions: { type: 'array', items: { $ref: '#/components/schemas/Progression' } },
-        },
-      },
-      Goal: goal,
-      Progression: progression,
-      ProjectsResponse: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['projects'],
-        properties: { projects: { type: 'array', items: { $ref: '#/components/schemas/Project' } } },
-      },
-      Project: project,
-      AgentGuide: { type: 'object', additionalProperties: true },
-      AgentTool: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['name', 'description', 'method', 'endpoint', 'input_schema'],
-        properties: {
-          name: { type: 'string' },
-          description: { type: 'string' },
-          method: { type: 'string', const: 'POST' },
-          endpoint: { type: 'string' },
-          input_schema: { $ref: '#/components/schemas/EmptyObject' },
-        },
-      },
-      AgentToolCatalog: {
-        type: 'object',
-        additionalProperties: false,
-        required: ['project', 'guide_url', 'openapi_url', 'tools'],
-        properties: {
-          project: { type: 'string' },
-          guide_url: { type: 'string' },
-          openapi_url: { type: 'string' },
-          tools: { type: 'array', items: { $ref: '#/components/schemas/AgentTool' } },
-        },
-      },
-    },
-  },
-});
-
 const knowledgeTerm = {
   type: 'object',
   additionalProperties: false,
@@ -342,7 +58,7 @@ export const KNOWLEDGE_OPENAPI_SPEC = Object.freeze({
     title: 'Eidolon-Atlas Knowledge API',
     version: '1.0.0',
     summary: 'Epistome-compatible browser operations for the encrypted Knowledge workspace.',
-    description: 'These operations use Atlas\'s unlocked browser-session model. They are not agent tools and do not accept the agent Bearer key as authorization to mutate Knowledge.',
+    description: 'These operations use Atlas\'s unlocked local-session model and the same loopback boundary as the rest of the native API.',
   },
   servers: [{ url: '/', description: 'The same local Eidolon-Atlas server.' }],
   security: [],
@@ -524,7 +240,6 @@ const jsonObjectRequest = {
   required: true,
   content: { 'application/json': { schema: { type: 'object', additionalProperties: true } } },
 };
-const optionalEmptyRequest = { ...emptyRequest, required: false };
 const pathParameter = (name) => ({ name, in: 'path', required: true, schema: { type: 'string', minLength: 1 } });
 const queryParameter = (name, schema, description) => ({ name, in: 'query', required: false, schema, description });
 const localOperation = (operationId, tag, summary, description, responses, requestBody) => ({
@@ -537,13 +252,13 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
     title: 'Eidolon-Atlas Local API',
     version: '1.0.0',
     summary: 'Complete same-origin API used by the Atlas browser application.',
-    description: 'Every non-agent /api route implemented by this Atlas server. Except for status, setup, and unlock, protected operations require Atlas to be unlocked. Browser mutations also enforce the loopback same-origin request boundary. The separate Agent API uses Bearer authentication and is documented above.',
+    description: 'Every /api route implemented by this Atlas server. Except for status, setup, and unlock, protected operations require Atlas to be unlocked. Browser mutations also enforce the loopback same-origin request boundary.',
   },
   servers: [{ url: '/', description: 'The same local Eidolon-Atlas server.' }],
   security: [],
   tags: [
     { name: 'Lifecycle', description: 'Initialization, lock state, unlock, and reset.' },
-    { name: 'Settings', description: 'Settings discovery and local agent-key management.' },
+    { name: 'Settings', description: 'Settings discovery for the native local API.' },
     { name: 'Records', description: 'Typed record CRUD, revisions, trash, and restore.' },
     { name: 'Goals', description: 'Goal progression and sibling prerequisites.' },
     { name: 'Images', description: 'Encrypted Experience image attachment operations.' },
@@ -577,25 +292,14 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
       }),
     },
     '/api/reset': {
-      post: localOperation('reset_atlas', 'Lifecycle', 'Clear all Atlas data', 'Verifies the current passphrase, permanently removes all data, metadata, staged imports, and agent credentials, then returns to first-time setup.', {
+      post: localOperation('reset_atlas', 'Lifecycle', 'Clear all Atlas data', 'Verifies the current passphrase, permanently removes all data, metadata, and staged imports, then returns to first-time setup.', {
         200: jsonResponse('Uninitialized locked status.', { $ref: '#/components/schemas/Status' }), 400: errorResponse, 401: errorResponse, 423: errorResponse,
       }, { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/PassphraseRequest' } } } }),
     },
     '/api/settings/api-reference': {
-      get: localOperation('get_api_reference', 'Settings', 'Get complete Settings API reference', 'Returns the agent tool catalog and guide, the Bearer Agent OpenAPI document, the complete local API document, and the separate Knowledge document.', {
+      get: localOperation('get_api_reference', 'Settings', 'Get complete Settings API reference', 'Returns the complete native local API document and the separate Knowledge document.', {
         200: jsonResponse('Settings API reference bundle.', { type: 'object' }), 423: errorResponse,
       }),
-    },
-    '/api/agent-key': {
-      get: localOperation('get_agent_key_status', 'Settings', 'Get agent-key status', 'Returns only whether an agent key is configured plus its non-secret prefix and creation time. The secret is never returned.', {
-        200: jsonResponse('Sanitized agent-key status.', { $ref: '#/components/schemas/AgentKeyStatus' }), 423: errorResponse,
-      }),
-      post: localOperation('generate_agent_key', 'Settings', 'Generate or rotate the agent key', 'Generates a new local Bearer key and immediately invalidates any previous key. The full secret is returned exactly once.', {
-        201: jsonResponse('New agent key and sanitized status.', { $ref: '#/components/schemas/GeneratedAgentKey' }), 400: errorResponse, 423: errorResponse,
-      }, optionalEmptyRequest),
-      delete: localOperation('revoke_agent_key', 'Settings', 'Revoke the agent key', 'Removes the stored key verifier so existing Bearer credentials stop working immediately.', {
-        200: jsonResponse('Revocation result.', { type: 'object', required: ['revoked'], properties: { revoked: { type: 'boolean' } } }), 400: errorResponse, 423: errorResponse,
-      }, optionalEmptyRequest),
     },
     '/api/records': {
       get: {
@@ -653,6 +357,21 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
         200: jsonResponse('Goal progression graph.', { type: 'object' }), ...unlockedErrors,
       }),
     },
+    '/api/goals/{id}/subgoals': {
+      parameters: [pathParameter('id')],
+      post: localOperation('create_subgoal', 'Goals', 'Create a subgoal atomically', 'Creates one direct subgoal and all selected sibling prerequisite edges in a single transaction. Repeating the same UUID requestId and body returns the original subgoal.', {
+        201: jsonResponse('Created or idempotently replayed subgoal.', { type: 'object' }), ...unlockedErrors,
+      }, { required: true, content: { 'application/json': { schema: {
+        type: 'object', additionalProperties: false,
+        required: ['requestId', 'title', 'data', 'prerequisiteIds'],
+        properties: {
+          requestId: { type: 'string', format: 'uuid' }, title: { type: 'string', minLength: 1 },
+          data: { type: 'object', additionalProperties: true },
+          customFieldValues: { type: 'object', additionalProperties: true },
+          prerequisiteIds: { type: 'array', uniqueItems: true, items: { type: 'string', minLength: 1 } },
+        },
+      } } } }),
+    },
     '/api/goals/{id}/prerequisites': {
       parameters: [pathParameter('id')],
       post: localOperation('create_goal_prerequisite', 'Goals', 'Add a sibling prerequisite', 'Adds a prerequisite edge to the selected Goal. Both endpoints must be siblings and the edge must remain acyclic.', {
@@ -670,13 +389,14 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
       get: localOperation('list_record_images', 'Images', 'List Experience images', 'Lists encrypted image attachment metadata for one Experience without returning image bytes.', {
         200: jsonResponse('Image metadata.', { type: 'array', items: { type: 'object' } }), ...unlockedErrors,
       }),
-      post: localOperation('upload_record_image', 'Images', 'Upload an Experience image', 'Uploads one JPEG, PNG, or WebP body. The optional X-Filename header supplies the original filename. Images are limited to 20 MiB and 50 per Experience.', {
+      post: { ...localOperation('upload_record_image', 'Images', 'Upload an Experience image', 'Uploads one JPEG, PNG, or WebP body. The required URI-encoded X-Atlas-Filename header supplies the original filename. Images are limited to 20 MiB and 50 per Experience.', {
         201: jsonResponse('Created image metadata.', { type: 'object' }), ...unlockedErrors, 413: errorResponse, 415: errorResponse,
       }, { required: true, content: {
         'image/jpeg': { schema: { type: 'string', contentEncoding: 'binary' } },
         'image/png': { schema: { type: 'string', contentEncoding: 'binary' } },
         'image/webp': { schema: { type: 'string', contentEncoding: 'binary' } },
-      } }),
+      } }), parameters: [{ name: 'X-Atlas-Filename', in: 'header', required: true,
+        description: 'URI-encoded original filename.', schema: { type: 'string', minLength: 1 } }] },
     },
     '/api/images/{id}/content': {
       parameters: [pathParameter('id')],
@@ -760,10 +480,6 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
   components: {
     schemas: {
       ...KNOWLEDGE_OPENAPI_SPEC.components.schemas,
-      EmptyObject: {
-        type: 'object', additionalProperties: false, properties: {},
-        description: 'An explicitly empty JSON object.',
-      },
       Status: {
         type: 'object', additionalProperties: false, required: ['initialized', 'locked'],
         properties: { initialized: { type: 'boolean' }, locked: { type: 'boolean' } },
@@ -775,16 +491,6 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
       RevisionRequest: {
         type: 'object', additionalProperties: false, required: ['revision'],
         properties: { revision: { type: 'integer', minimum: 1 } },
-      },
-      AgentKeyStatus: {
-        type: 'object', additionalProperties: false, required: ['configured', 'prefix', 'createdAt'],
-        properties: { configured: { type: 'boolean' }, prefix: { type: ['string', 'null'] }, createdAt: { type: ['string', 'null'], format: 'date-time' } },
-      },
-      GeneratedAgentKey: {
-        allOf: [
-          { $ref: '#/components/schemas/AgentKeyStatus' },
-          { type: 'object', required: ['key'], properties: { key: { type: 'string', writeOnly: true, description: 'Shown once.' } } },
-        ],
       },
       Record: { type: 'object', additionalProperties: true },
     },

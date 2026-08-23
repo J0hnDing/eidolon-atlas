@@ -20,7 +20,8 @@ secret. The passphrase and derived key are never stored.
 Every encrypted payload uses AES-256-GCM with a fresh random nonce and full
 authentication tag. Associated data binds ciphertext to its object type,
 identity, category, and revision so copied or swapped blobs fail validation.
-Restart or manual lock discards the in-memory key.
+Restart or manual lock discards the in-memory key and invalidates transient key
+copies and asynchronous lifecycle work from the prior unlocked generation.
 
 ## Deliberate limitations
 
@@ -44,25 +45,24 @@ with control of the same account may be able to access the local service or
 application memory.
 
 The Settings Clear All action requires the current atlas passphrase. After it
-is verified, Atlas permanently removes all user content, staged imports, agent
-credentials, and encryption metadata, discards the in-memory key, and returns
-to first-time passphrase setup. A failed passphrase check does not delete data.
+is verified, Atlas permanently removes all user content, staged imports, and
+encryption metadata, discards the in-memory key, and returns to first-time
+passphrase setup. A failed passphrase check does not delete data.
 
-## Agent API keys
+## Native local API
 
-The optional agent API uses one local, rotatable key. Atlas stores only a
-SHA-256 verifier and non-secret display metadata; the `atlas_...` secret is
-shown once when generated or rotated and is never logged or included in
-encrypted backups. Revocation and rotation invalidate the previous key
-immediately. Every agent discovery and read request requires
-`Authorization: Bearer <key>` and an unlocked Atlas; missing or invalid keys
-return `401`, while a valid key while locked returns `423`.
+The browser and trusted local integrations use the same loopback API. Atlas
+does not authenticate individual local clients: protected operations are
+available while the process-wide Atlas state is unlocked and return `423`
+while it is locked. Browser mutations validate same-origin requests. A local
+process running under the trusted Windows account can call the API directly,
+which is part of the documented single-user threat boundary.
 
 ## Backups
 
 Exports use their own salt, key derivation parameters, nonce, and authentication
-tag. Backup v2 is a streamed binary encrypted `.atlas` format; imports stage
-encrypted content and atomically replace the database without decrypted
-temporary image files. v1 JSON envelopes remain import-compatible. A backup
-passphrase is requested for every export or import and is never stored. Keep at
-least one tested backup away from the live database.
+tag. Backup v3 streams bounded frames instead of one complete manifest; imports
+stage encrypted content and atomically replace the database without decrypted
+temporary image files. v1 JSON envelopes and v2 binary files remain
+import-compatible. A backup passphrase is requested for every export or import
+and is never stored. Keep at least one tested backup away from the live database.

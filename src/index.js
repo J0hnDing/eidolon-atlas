@@ -10,6 +10,7 @@ const atlas = new Atlas({ databasePath });
 const server = createServer({ atlas, publicDir });
 
 await listen(server, { port });
+process.once('exit', () => atlas.close());
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.once(signal, () => server.close(() => process.exit(0)));

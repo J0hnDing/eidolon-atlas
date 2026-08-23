@@ -164,8 +164,11 @@ const state = {
   trashCount: 0,
   loading: false,
   loadToken: 0,
+  authGeneration: 0,
+  pendingRequests: new Set(),
   route: null,
   detailMode: null,
+  goalGraphObserver: null,
   gallery: { recordId: null, images: [], loading: false },
   lightboxIndex: -1,
   knowledge: {
@@ -173,6 +176,11 @@ const state = {
     collapsedBranches: new Set(), collapsedNodes: new Set(), disclosureInitialized: false
   }
 };
+
+function disconnectGoalGraphObserver() {
+  state.goalGraphObserver?.disconnect();
+  state.goalGraphObserver = null;
+}
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
@@ -230,34 +238,68 @@ async function api(path, options = {}) {
     init.headers["Content-Type"] = "application/json";
     init.body = JSON.stringify(options.body);
   }
-  const response = await fetch(`/api${path}`, init);
-  const type = response.headers.get("content-type") || "";
-  let payload = null;
-  if (response.status !== 204) {
-    try { payload = type.includes("json") ? await response.json() : await response.text(); }
-    catch { payload = null; }
-  }
-  if (!response.ok) {
-    const error = new Error(errorMessage(payload, `Request failed (${response.status})`));
-    error.status = response.status;
-    error.payload = payload;
-    throw error;
-  }
-  return payload;
+  return trackedRequest(`/api${path}`, init, async (response) => {
+    const type = response.headers.get("content-type") || "";
+    let payload = null;
+    if (response.status !== 204) {
+      try { payload = type.includes("json") ? await response.json() : await response.text(); }
+      catch { payload = null; }
+    }
+    if (!response.ok) throw responseError(response, payload);
+    return payload;
+  });
 }
 
 async function rawApi(path, options = {}) {
   const headers = { Accept: options.accept || "application/json", ...(options.headers || {}) };
-  const response = await fetch(`/api${path}`, { method: options.method || "GET", headers, body: options.body });
-  if (!response.ok) {
-    let payload = null;
-    try { payload = (response.headers.get("content-type") || "").includes("json") ? await response.json() : await response.text(); } catch { /* best effort */ }
-    const error = new Error(errorMessage(payload, `Request failed (${response.status})`));
-    error.status = response.status;
-    error.payload = payload;
+  return trackedRequest(`/api${path}`, { method: options.method || "GET", headers, body: options.body }, async (response) => {
+    const type = response.headers.get("content-type") || "";
+    if (!response.ok) {
+      let payload = null;
+      try { payload = type.includes("json") ? await response.json() : await response.text(); } catch { /* best effort */ }
+      throw responseError(response, payload);
+    }
+    if (options.responseType === "json") return response.status === 204 ? null : response.json();
+    if (options.responseType === "backup") {
+      if (type.includes("json")) return { type, payload: await response.json(), blob: null };
+      return { type, payload: null, blob: await response.blob() };
+    }
+    if (response.status !== 204) await response.arrayBuffer();
+    return null;
+  });
+}
+
+function responseError(response, payload) {
+  const error = new Error(errorMessage(payload, `Request failed (${response.status})`));
+  error.status = response.status;
+  error.payload = payload;
+  return error;
+}
+
+async function trackedRequest(url, init, consume) {
+  const controller = new AbortController();
+  const generation = state.authGeneration;
+  state.pendingRequests.add(controller);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const result = await consume(response);
+    if (generation !== state.authGeneration) {
+      const error = new Error("");
+      error.stale = true;
+      throw error;
+    }
+    return result;
+  } catch (error) {
+    if (error?.status === 423) lockLocally();
+    if (error?.name === "AbortError" && generation !== state.authGeneration) {
+      const stale = new Error("");
+      stale.stale = true;
+      throw stale;
+    }
     throw error;
+  } finally {
+    state.pendingRequests.delete(controller);
   }
-  return response;
 }
 
 function listPayload(payload, key) {
@@ -323,6 +365,7 @@ function formatTimestamp(value) {
 }
 
 function notify(message, kind = "info") {
+  if (!message) return;
   const notice = element("div", { class: `notice ${kind}`, role: "status" }, [icon(kind === "error" ? "close" : "check"), element("span", { text: message })]);
   $("#notice-region").append(notice);
   window.setTimeout(() => notice.remove(), 4600);
@@ -476,7 +519,6 @@ function navigateBackFromDetail(category) {
 
 async function applyRoute(route) {
   if (!route) route = routeFromLocation();
-  if (state.route?.kind === "settings" && route.kind !== "settings") clearAgentKeySecret();
   state.route = route;
   if (route.kind.startsWith("knowledge")) {
     closeSidebar();
@@ -534,13 +576,21 @@ function updateHeading() {
   $("#new-record span:last-child").textContent = "Add entry";
   $("#new-record-top .button-label").textContent = "Add entry";
   $("#empty-trash").hidden = true;
-  $$(".category-nav .nav-row").forEach((button) => button.classList.toggle("active", !state.trash && !state.query && button.dataset.category === state.category));
+  $$(".category-nav .nav-row").forEach((button) => {
+    const active = !state.trash && !state.query && button.dataset.category === state.category;
+    button.classList.toggle("active", active);
+    if (active) button.setAttribute("aria-current", "page"); else button.removeAttribute("aria-current");
+  });
   $("[data-workspace='knowledge']")?.classList.remove("active");
   $("#settings-button")?.classList.toggle("active", state.trash);
   const canToggle = !state.trash && !state.query && !["experience", "goal", "person"].includes(state.category) &&
     !(state.category === "relationship" && state.filter === "all");
   $("#view-toggle").hidden = !canToggle;
-  $$("#view-toggle button").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
+  $$("#view-toggle button").forEach((button) => {
+    const active = button.dataset.view === state.view;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", String(active));
+  });
   renderFilters();
 }
 
@@ -587,6 +637,7 @@ async function loadCategory() {
     state.customFieldsCategory = state.trash || state.query ? null : state.category;
     renderRecords();
   } catch (error) {
+    if (error.stale) return;
     if (error.status === 401 || error.status === 423) return lockLocally();
     renderFailure(error);
   } finally { if (token === state.loadToken) state.loading = false; }
@@ -651,7 +702,7 @@ function renderRelationshipOverview(records) {
 function renderFailure(error) {
   const stage = $("#content-stage");
   stage.replaceChildren(element("section", { class: "empty-state" }, element("div", {}, [
-    element("div", { class: "empty-orbit" }, icon("close")), element("h2", { text: "This view could not be opened" }), element("p", { text: error.message }), element("button", { class: "button button-secondary", type: "button", text: "Try again", onclick: loadCategory })
+    element("div", { class: "empty-orbit" }, icon("close")), element("h2", { text: "This view could not be opened" }), element("p", { text: error.message }), element("button", { class: "button button-secondary", type: "button", text: "Try again", onclick: () => applyRoute(state.route) })
   ])));
 }
 
@@ -827,9 +878,11 @@ async function openDetail(id, { fromRoute = false } = {}) {
     renderDetail(state.selected, $("#detail-content"), false);
     $("#detail-pane").classList.add("open");
     $("#detail-pane").setAttribute("aria-hidden", "false");
+    $("#detail-pane").inert = false;
     $(".workspace").classList.add("detail-open");
     window.setTimeout(() => $("#close-detail").focus(), 50);
   } catch (error) {
+    if (error.stale) return;
     notify(error.message, "error");
     if (fromRoute) await navigateTo({ kind: "list", category: state.category }, { replace: true });
   }
@@ -841,8 +894,10 @@ function closeDetail({ navigate = true } = {}) {
     return;
   }
   state.selected = null;
+  disconnectGoalGraphObserver();
   $("#detail-pane").classList.remove("open");
   $("#detail-pane").setAttribute("aria-hidden", "true");
+  $("#detail-pane").inert = true;
   $(".workspace").classList.remove("detail-open");
 }
 
@@ -863,8 +918,7 @@ function renderExperienceGallery(record) {
 
 async function loadExperienceImages(record, galleryRoot) {
   try {
-    const response = await rawApi(`/records/${encodeURIComponent(record.id)}/images`);
-    const payload = await response.json();
+    const payload = await rawApi(`/records/${encodeURIComponent(record.id)}/images`, { responseType: "json" });
     const images = listPayload(payload, "images");
     state.gallery = { recordId: record.id, images, loading: false };
     if (!galleryRoot?.isConnected) return;
@@ -879,6 +933,7 @@ async function loadExperienceImages(record, galleryRoot) {
       galleryRoot.append(card);
     });
   } catch (error) {
+    if (error.stale) return;
     if (error.status === 401 || error.status === 423) return lockLocally();
     if (galleryRoot?.isConnected) galleryRoot.replaceChildren(element("p", { class: "detail-empty", text: `Images unavailable: ${error.message}` }));
   }
@@ -898,7 +953,8 @@ async function uploadExperienceImages(record, files) {
       await rawApi(`/records/${encodeURIComponent(record.id)}/images`, {
         method: "POST",
         headers: { "Content-Type": file.type, "X-Atlas-Filename": encodeURIComponent(file.name) },
-        body: file
+        body: file,
+        responseType: "json"
       });
     }
     notify(`${selected.length} image${selected.length === 1 ? "" : "s"} uploaded.`, "success");
@@ -951,6 +1007,7 @@ function displayDetailValue(value, type) {
 }
 
 function renderDetail(record, target = $("#detail-content"), fullPage = false) {
+  disconnectGoalGraphObserver();
   let root = target;
   if (fullPage) {
     const page = element("div", { class: "detail-page" });
@@ -1121,6 +1178,7 @@ async function loadKnowledge(route = state.route) {
     renderKnowledgeWorkspace(route);
     $("#main-content").focus({ preventScroll: true });
   } catch (error) {
+    if (error.stale) return;
     if (error.status === 401 || error.status === 423) return lockLocally();
     renderFailure(error);
   }
@@ -1455,8 +1513,12 @@ async function loadGoalProgression(record, body) {
     body.append(element("div", { class: "goal-graph-scroll" }, canvas));
     const draw = () => drawGoalGraphEdges(canvas, svg, graph.dependencies, graph.nodes.filter((node) => outgoing.get(node.id).length === 0));
     requestAnimationFrame(draw);
-    if (window.ResizeObserver) new ResizeObserver(draw).observe(canvas);
+    if (window.ResizeObserver) {
+      state.goalGraphObserver = new ResizeObserver(draw);
+      state.goalGraphObserver.observe(canvas);
+    }
   } catch (error) {
+    if (error.stale) return;
     if (body.isConnected) body.replaceChildren(element("p", { class: "detail-empty", text: `Progression unavailable: ${error.message}` }));
   }
 }
@@ -1522,6 +1584,7 @@ function openSubgoalDialog(goal) {
   document.querySelector("#subgoal-dialog")?.remove();
   const dialog = element("dialog", { id: "subgoal-dialog", class: "modal modal-small" });
   const form = element("form", { method: "dialog" });
+  form.dataset.requestId = crypto.randomUUID();
   form.append(
     element("header", { class: "modal-header" }, [element("div", {}, [element("p", { class: "eyebrow", text: "Build the path" }), element("h2", { text: "Add subgoal" })]), element("button", { class: "icon-button", type: "button", "aria-label": "Close", onclick: () => dialog.close() }, icon("close"))]),
     element("div", { class: "modal-body form-grid" }, [
@@ -1538,11 +1601,12 @@ function openSubgoalDialog(goal) {
   dialog.append(form); document.body.append(dialog); dialog.addEventListener("close", () => dialog.remove()); dialog.showModal();
   api(`/goals/${encodeURIComponent(goal.id)}/progression`).then((graph) => {
     const options = dialog.querySelector(".subgoal-prerequisite-options");
+    if (!options) return;
     options.replaceChildren();
     if (!graph.nodes.length) return options.append(element("p", { class: "detail-empty", text: "This will be the first step." }));
     graph.nodes.forEach((node) => options.append(element("label", { class: "check-row" }, [element("input", { type: "checkbox", name: "prerequisite", value: node.id }), element("span", { text: `${recordTitle(node)} · ${node.progress}%` })])));
   }).catch((error) => notify(error.message, "error"));
-  setTimeout(() => form.elements.title.focus(), 30);
+  setTimeout(() => { if (form.isConnected) form.elements.title.focus(); }, 30);
 }
 
 async function saveSubgoal(event, goal, dialog) {
@@ -1552,15 +1616,12 @@ async function saveSubgoal(event, goal, dialog) {
   const button = form.querySelector("button[type='submit']");
   setButtonBusy(button, true, "Adding…");
   try {
-    const createdPayload = await api("/records", { method: "POST", body: {
-      category: "goal", title: form.elements.title.value.trim(), parentId: goal.id,
+    await api(`/goals/${encodeURIComponent(goal.id)}/subgoals`, { method: "POST", body: {
+      requestId: form.dataset.requestId, title: form.elements.title.value.trim(),
       data: { horizon: goal.data?.horizon || "short", importance: form.elements.importance.value, targetDate: form.elements.targetDate.value.trim(), description: form.elements.description.value.trim(), progress: Number(form.elements.progress.value) },
-      customFieldValues: {}
+      customFieldValues: {},
+      prerequisiteIds: [...form.querySelectorAll("[name='prerequisite']:checked")].map((input) => input.value)
     } });
-    const created = recordPayload(createdPayload);
-    for (const input of form.querySelectorAll("[name='prerequisite']:checked")) {
-      await api(`/goals/${encodeURIComponent(created.id)}/prerequisites`, { method: "POST", body: { prerequisiteId: input.value } });
-    }
     dialog.close(); notify("Subgoal added to the progression.", "success"); await openFullPageDetail(goal.id);
   } catch (error) { notify(error.message, "error"); setButtonBusy(button, false); }
 }
@@ -1585,6 +1646,7 @@ async function openFullPageDetail(id) {
     renderDetail(state.selected, $("#content-stage"), true);
     $("#main-content").focus({ preventScroll: true });
   } catch (error) {
+    if (error.stale) return;
     notify(error.message, "error");
     await navigateTo({ kind: "list", category: state.category }, { replace: true });
   }
@@ -1604,7 +1666,10 @@ async function loadRevisions(id, root) {
       element("div", {}, [element("strong", { text: `Revision ${revision.revision}` }), element("small", { text: formatTimestamp(revision.createdAt || revision.updatedAt) })]),
       revision.revision !== state.selected?.revision ? element("button", { class: "text-button", type: "button", text: "Restore", onclick: () => restoreRevision(revision.revision) }) : element("small", { text: "Current" })
     ])));
-  } catch (error) { root.replaceChildren(element("p", { class: "detail-empty", text: `History unavailable: ${error.message}` })); }
+  } catch (error) {
+    if (error.stale) return;
+    root.replaceChildren(element("p", { class: "detail-empty", text: `History unavailable: ${error.message}` }));
+  }
 }
 
 async function restoreRevision(revision) {
@@ -1628,7 +1693,8 @@ function inputForDefinition(definition, value = "") {
     const list = element("div", { class: "repeatable-list", dataset: { repeatable: key } });
     const add = (itemValue = "") => {
       const row = element("div", { class: "repeatable-row" });
-      const input = element("input", { type: type === "repeatableEmail" ? "email" : "text", value: itemValue, placeholder, required: required && !list.children.length });
+      const input = element("input", { type: type === "repeatableEmail" ? "email" : "text", value: itemValue,
+        placeholder, required: required && !list.children.length, "aria-label": `${label} ${list.children.length + 1}` });
       const remove = element("button", { class: "icon-button", type: "button", "aria-label": `Remove ${label.toLowerCase()}`, onclick: () => { row.remove(); if (required && !list.querySelector("input")) add(); } }, icon("close"));
       row.append(input, remove);
       list.append(row);
@@ -1671,6 +1737,7 @@ async function openRecordDialog(record = null) {
       state.customFields = listPayload(fieldsPayload, "customFields").filter((field) => field.category === category);
       state.customFieldsCategory = category;
     } catch (error) {
+      if (error.stale) return;
       notify(`Custom fields could not be loaded. ${error.message}`, "error");
       return;
     }
@@ -1771,6 +1838,7 @@ async function saveRecord(event) {
       await Promise.all([loadCategory(), refreshCounts()]);
     }
   } catch (error) {
+    if (error.stale) return;
     if (error.status === 409) notify("This entry changed in another session. Reopen it and try again.", "error");
     else notify(error.message, "error");
   } finally { setButtonBusy(button, false); }
@@ -1917,7 +1985,7 @@ function requestSecret() {
       dialog.removeEventListener("close", onClose);
       form.removeEventListener("submit", onSubmit);
       const value = dialog.returnValue === "confirm" ? $("#secret-passphrase").value : null;
-      if (!value) $("#secret-passphrase").value = "";
+      $("#secret-passphrase").value = "";
       resolve(value);
     };
     const onSubmit = (event) => { event.preventDefault(); if (form.reportValidity()) dialog.close("confirm"); };
@@ -1931,14 +1999,14 @@ async function exportBackup() {
   const passphrase = await requestSecret();
   if (!passphrase) return;
   try {
-    const response = await rawApi("/export", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/vnd.eidolon-atlas-backup, application/octet-stream, application/json" }, body: JSON.stringify({ passphrase }) });
-    const type = response.headers.get("content-type") || "application/octet-stream";
+    const response = await rawApi("/export", { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/vnd.eidolon-atlas-backup, application/octet-stream, application/json" }, body: JSON.stringify({ passphrase }), responseType: "backup" });
+    const type = response.type || "application/octet-stream";
     let blob;
     if (type.includes("json")) {
-      const payload = await response.json();
+      const payload = response.payload;
       const envelope = payload?.envelope ?? payload;
       blob = new Blob([JSON.stringify(envelope, null, 2)], { type: "application/json" });
-    } else blob = await response.blob();
+    } else blob = response.blob;
     const url = URL.createObjectURL(blob);
     const link = element("a", { href: url, download: `eidolon-atlas-${new Date().toISOString().slice(0,10)}.atlas` });
     document.body.append(link); link.click(); link.remove(); URL.revokeObjectURL(url);
@@ -1960,8 +2028,7 @@ async function importBackup() {
       const envelope = JSON.parse(await file.text());
       await api("/import", { method: "POST", body: { passphrase, envelope } });
     } else {
-      const uploaded = await rawApi("/import-uploads", { method: "POST", headers: { "Content-Type": "application/vnd.eidolon-atlas-backup", Accept: "application/json" }, body: file });
-      const payload = await uploaded.json();
+      const payload = await rawApi("/import-uploads", { method: "POST", headers: { "Content-Type": "application/vnd.eidolon-atlas-backup", Accept: "application/json" }, body: file, responseType: "json" });
       uploadId = payload?.uploadId;
       if (!uploadId) throw new Error("The backup upload did not return an upload id.");
       await api(`/import-uploads/${encodeURIComponent(uploadId)}/commit`, { method: "POST", body: { passphrase } });
@@ -1974,7 +2041,11 @@ async function importBackup() {
   } catch (error) {
     if (uploadId) { try { await rawApi(`/import-uploads/${encodeURIComponent(uploadId)}`, { method: "DELETE" }); } catch { /* best effort cleanup */ } }
     notify(error instanceof SyntaxError ? "That file is not a valid atlas backup." : error.message, "error");
-  } finally { setButtonBusy(button, false); }
+  } finally {
+    $("#backup-passphrase").value = "";
+    setButtonBusy(button, false);
+    button.disabled = true;
+  }
 }
 
 function openPromptDialog() {
@@ -2015,7 +2086,7 @@ function setSettingsChrome() {
   $("#view-heading").classList.remove("route-hidden");
   $("#view-eyebrow").textContent = "Atlas controls";
   $("#view-title").textContent = "Settings";
-  $("#view-description").textContent = "Manage local access, review the agent contract, and open maintenance tools.";
+  $("#view-description").textContent = "Review the native API contract and open maintenance tools.";
   $("#filter-bar").replaceChildren();
   $("#view-toggle").hidden = true;
   $("#empty-trash").hidden = true;
@@ -2030,17 +2101,18 @@ async function loadSettings() {
   setSettingsChrome();
   renderSkeleton();
   try {
-    const [keyStatus, reference] = await Promise.all([api("/agent-key"), api("/settings/api-reference")]);
+    const reference = await api("/settings/api-reference");
     if (token !== state.loadToken) return;
-    renderSettings(keyStatus, reference);
+    renderSettings(reference);
     $("#main-content").focus({ preventScroll: true });
   } catch (error) {
+    if (error.stale) return;
     if (error.status === 401 || error.status === 423) return lockLocally();
     renderFailure(error);
   }
 }
 
-function renderSettings(keyStatus, reference) {
+function renderSettings(reference) {
   const stage = $("#content-stage");
   stage.replaceChildren();
   const page = element("div", { class: "settings-page" });
@@ -2071,70 +2143,10 @@ function renderSettings(keyStatus, reference) {
     ])
   ]));
 
-  const agentCard = element("article", { id: "agent-access-panel", class: "settings-card settings-agent-card" }, [
-    element("div", { class: "settings-card-icon" }, icon("key")),
-    element("div", { class: "settings-card-copy" }, [
-      element("p", { class: "eyebrow", text: "Read-only integration" }),
-      element("h2", { text: "Agent access" }),
-      element("p", { text: "One local key can read only the documented Person, Experience, Goal, and Project projections while Atlas is unlocked." }),
-      element("div", { id: "agent-key-status", class: "agent-key-status", "aria-live": "polite" }),
-      element("div", { id: "agent-key-secret", class: "agent-key-secret", hidden: true }, [
-        element("label", { class: "field" }, [element("span", { text: "Copy this key now" }), element("input", { id: "agent-key-value", type: "text", readonly: true, spellcheck: "false" })]),
-        element("p", { class: "microcopy", text: "Atlas stores only a verifier. This key will not be shown again." }),
-        element("button", { id: "copy-agent-key", class: "button button-secondary button-wide", type: "button", text: "Copy key", onclick: copyAgentKey })
-      ])
-    ]),
-    element("div", { class: "settings-card-action settings-agent-actions" }, [
-      element("button", { id: "revoke-agent-key", class: "button button-quiet", type: "button", text: "Revoke", hidden: true, onclick: revokeAgentKey }),
-      element("button", { id: "generate-agent-key", class: "button button-primary", type: "button", text: "Generate key", onclick: generateAgentKey })
-    ])
-  ]);
-  maintenance.append(agentCard);
   page.append(maintenance);
 
-  const spec = reference?.agentOpenapi || {};
-  const tools = new Map((reference?.tools || []).map((tool) => [tool.endpoint, tool]));
-  const endpointList = element("div", { class: "api-endpoint-list" });
-  for (const [path, methods] of Object.entries(spec.paths || {})) {
-    for (const [method, operation] of Object.entries(methods)) {
-      const tool = tools.get(path);
-      const responses = Object.keys(operation.responses || {}).join(" · ");
-      endpointList.append(element("article", { class: "api-endpoint" }, [
-        element("header", { class: "api-endpoint-head" }, [
-          element("span", { class: `api-method ${method}`, text: method.toUpperCase() }),
-          element("code", { text: path })
-        ]),
-        element("h3", { text: operation.summary || tool?.name || path }),
-        element("p", { text: tool?.description || operation.description || "No operation description is available." }),
-        element("div", { class: "api-endpoint-meta" }, [
-          element("span", { text: method === "post" ? "Input: {} only" : "No request body" }),
-          element("span", { text: `Responses: ${responses}` })
-        ]),
-        element("details", { class: "api-schema" }, [
-          element("summary", { text: "View operation specification" }),
-          element("pre", { text: JSON.stringify(operation, null, 2) })
-        ])
-      ]));
-    }
-  }
-  const apiSection = element("section", { class: "settings-api" }, [
-    element("header", { class: "settings-section-head" }, [
-      element("div", {}, [element("p", { class: "eyebrow", text: "OpenAPI 3.1 · Agent tools" }), element("h2", { text: spec.info?.title || "Agent API" }), element("p", { text: spec.info?.description || "Authenticated, stateless, read-only access." })]),
-      element("div", { class: "api-facts" }, [
-        element("span", {}, [element("strong", { text: "Base" }), element("code", { text: window.location.origin })]),
-        element("span", {}, [element("strong", { text: "Auth" }), element("code", { text: "Bearer atlas_…" })])
-      ])
-    ]),
-    endpointList,
-    element("div", { class: "api-reference-files" }, [
-      element("details", { class: "api-schema" }, [element("summary", { text: "View complete agent guide" }), element("pre", { text: JSON.stringify(reference?.guide || {}, null, 2) })]),
-      element("details", { class: "api-schema" }, [element("summary", { text: "View complete OpenAPI JSON" }), element("pre", { text: JSON.stringify(spec, null, 2) })])
-    ])
-  ]);
-  page.append(apiSection);
   page.append(renderBrowserApiReference(reference?.browserOpenapi || reference?.knowledgeOpenapi || {}));
   stage.append(page);
-  renderAgentKeyStatus(keyStatus);
 }
 
 function apiRequestLabel(operation) {
@@ -2190,56 +2202,6 @@ function renderBrowserApiReference(spec) {
   ]);
 }
 
-function clearAgentKeySecret() {
-  const value = $("#agent-key-value");
-  const secret = $("#agent-key-secret");
-  if (value) value.value = "";
-  if (secret) secret.hidden = true;
-}
-
-function renderAgentKeyStatus(status) {
-  if (!$("#agent-key-status")) return;
-  const configured = Boolean(status?.configured);
-  $("#agent-key-status").replaceChildren(element("div", { class: `agent-key-state${configured ? " configured" : ""}` }, [
-    element("span", {}, icon(configured ? "check" : "key")),
-    element("div", {}, [element("strong", { text: configured ? "Agent key configured" : "No agent key" }), element("p", { text: configured ? `${status.prefix || "atlas_…"}${status.createdAt ? ` · created ${formatTimestamp(status.createdAt)}` : ""}` : "Generate one key when an agent needs read-only access." })])
-  ]));
-  $("#generate-agent-key").textContent = configured ? "Rotate key" : "Generate key";
-  $("#revoke-agent-key").hidden = !configured;
-  $("#agent-access-panel").dataset.configured = String(configured);
-}
-
-async function generateAgentKey() {
-  const configured = $("#agent-access-panel")?.dataset.configured === "true";
-  if (configured && !confirm("Rotate the agent key? The current key will stop working immediately.")) return;
-  const button = $("#generate-agent-key"); setButtonBusy(button, true, configured ? "Rotating…" : "Generating…");
-  try {
-    const result = await api("/agent-key", { method: "POST", body: {} });
-    const secret = result.key || result.apiKey || result.secret;
-    if (!secret) throw new Error("Atlas did not return the generated key.");
-    $("#agent-key-value").value = secret;
-    $("#agent-key-secret").hidden = false;
-    renderAgentKeyStatus(result);
-    button.dataset.original = "Rotate key";
-    $("#agent-key-value").select();
-  } catch (error) { notify(error.message, "error"); }
-  finally { setButtonBusy(button, false); }
-}
-
-async function copyAgentKey() {
-  const value = $("#agent-key-value").value;
-  if (!value) return;
-  try { await navigator.clipboard.writeText(value); notify("Agent key copied.", "success"); }
-  catch { $("#agent-key-value").select(); notify("Copy is unavailable. The key is selected for manual copying."); }
-}
-
-async function revokeAgentKey() {
-  if (!confirm("Revoke the agent key? Existing agent calls will stop working immediately.")) return;
-  const button = $("#revoke-agent-key"); setButtonBusy(button, true, "Revoking…");
-  try { const status = await api("/agent-key", { method: "DELETE", body: {} }); clearAgentKeySecret(); renderAgentKeyStatus(status); notify("Agent key revoked.", "success"); }
-  catch (error) { notify(error.message, "error"); } finally { setButtonBusy(button, false); }
-}
-
 function openPrimaryCreate() {
   if (state.route?.kind?.startsWith("knowledge")) openKnowledgeNodeDialog();
   else openRecordDialog();
@@ -2266,14 +2228,11 @@ async function clearAllAtlas(event) {
   setButtonBusy(button, true, "Clearing…");
   try {
     await api("/reset", { method: "POST", body: { passphrase: form.elements.passphrase.value } });
-    $("#clear-all-dialog").close();
-    form.reset();
-    resetLocalAtlasState();
     window.history.replaceState({}, "", "/");
-    $("#setup-form").reset();
-    showAuth("setup");
+    transitionToAuth("setup");
     notify("All atlas data was permanently deleted.", "success");
   } catch (error) {
+    if (error.stale) return;
     notify(error.message, "error");
     form.elements.passphrase.select();
   } finally {
@@ -2282,22 +2241,50 @@ async function clearAllAtlas(event) {
 }
 
 function lockLocally() {
+  if ($("#app").hidden && !$("#auth-view").hidden && !$("#unlock-form").hidden) return;
+  transitionToAuth("unlock");
+}
+
+function transitionToAuth(mode) {
+  state.authGeneration += 1;
+  for (const controller of state.pendingRequests) controller.abort();
+  state.pendingRequests.clear();
   resetLocalAtlasState();
-  $("#unlock-form").reset();
-  showAuth("unlock");
+  $(mode === "setup" ? "#setup-form" : "#unlock-form").reset();
+  showAuth(mode);
 }
 
 function resetLocalAtlasState() {
+  state.loadToken += 1;
+  for (const dialog of $$('dialog[open]')) dialog.close("auth-transition");
+  document.querySelector("#subgoal-dialog")?.remove();
+  $$("#app form, body > dialog form").forEach((form) => form.reset());
+  $$("#app img, body > dialog img").forEach((image) => {
+    image.removeAttribute("src");
+    image.alt = "";
+  });
   closeDetail({ navigate: false });
   state.records = [];
   state.allRecords = [];
   state.customFields = [];
   state.customFieldsCategory = null;
+  state.selected = null;
+  state.editing = null;
   state.query = "";
+  state.route = null;
+  state.detailMode = null;
+  state.gallery = { recordId: null, images: [], loading: false };
+  state.lightboxIndex = -1;
   state.knowledge.branches = [];
   state.knowledge.nodes = [];
   state.knowledge.selected = null;
-  clearAgentKeySecret();
+  $("#global-search").value = "";
+  $("#content-stage").replaceChildren();
+  $("#detail-content").replaceChildren();
+  $("#record-fields").replaceChildren();
+  $("#notice-region").replaceChildren();
+  $("#sidebar").classList.remove("open");
+  $("#sidebar-scrim").hidden = true;
   $$('[data-count]').forEach((node) => { node.textContent = "0"; });
 }
 
@@ -2366,7 +2353,7 @@ function wireEvents() {
   let searchTimer;
   $("#global-search").addEventListener("input", (event) => {
     window.clearTimeout(searchTimer);
-    searchTimer = window.setTimeout(() => navigateTo({ kind: "search", query: event.target.value.trim() }), 240);
+    searchTimer = window.setTimeout(() => navigateTo({ kind: "search", query: event.target.value.trim() }, { replace: true }), 240);
   });
   $$("#view-toggle button").forEach((button) => button.addEventListener("click", () => navigateTo({ kind: "list", category: state.category, filter: state.filter, view: button.dataset.view }, { replace: true })));
   document.addEventListener("keydown", (event) => {
@@ -2380,4 +2367,8 @@ function wireEvents() {
   window.addEventListener("popstate", () => { if (!$("#app").hidden) applyRoute(routeFromLocation()); });
 }
 
-initialize();
+if (globalThis.process?.env?.NODE_ENV === "test") {
+  globalThis.__atlasTest = { api, state, transitionToAuth };
+} else {
+  initialize();
+}

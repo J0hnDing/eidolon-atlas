@@ -37,17 +37,20 @@ boundaries as the other workspaces. Structural Knowledge metadata remains
 queryable in SQLite; names, explanations, and terms stay inside encrypted
 payloads. The browser contract is namespaced under `/api/knowledge`.
 
-Atlas also exposes a deliberately small read-only agent contract. Discovery,
-the guide, OpenAPI, and four read operations require a generated Bearer API
-key and an unlocked Atlas. There are no agent mutation routes, MCP surface,
-plaintext Knowledge transfer, or Knowledge reset endpoint.
+Atlas exposes one native loopback API to its browser and trusted local
+integrations. Except for status, setup, and unlock, operations require the
+process-wide Atlas state to be unlocked. Mutating browser requests enforce the
+loopback same-origin boundary; native clients do not use a separate credential.
+One process owns a database through an atomic lease acquired before database or
+import-staging cleanup. Setup, unlock, reset, and import replacement are
+serialized, and lock invalidates any asynchronous transition that began under
+an earlier lifecycle generation.
 
-The unlocked Settings page reads the same server-owned agent tool, guide, and
-OpenAPI objects plus a complete OpenAPI document for every implemented
-non-agent `/api/*` operation through `/api/settings/api-reference`. The payload
-also retains the narrower Knowledge-only document for contract consumers. This
-browser route is not part of the Bearer-authenticated agent surface. Settings
-also owns key management and navigation into Recently removed.
+The unlocked Settings page reads the server-owned complete OpenAPI document
+for every implemented `/api/*` operation through
+`/api/settings/api-reference`. The payload also retains the narrower
+Knowledge-only document for contract consumers. Settings also owns navigation
+into Recently removed.
 
 ## Reads and search
 
@@ -64,7 +67,9 @@ decrypts and validates the complete snapshot before beginning one replacement
 transaction. A failed decrypt, validation, or write leaves the existing atlas
 unchanged.
 
-Backup v2 is a streamed binary encrypted `.atlas` format containing
-attachments. Import uses encrypted staging, never decrypted temporary image
-files, and atomically replaces the atlas after validation. Legacy v1 JSON
-backup envelopes remain import-compatible.
+Backup v3 is a framed streamed `.atlas` format. Records, revisions, fields,
+links, Knowledge entries, image metadata, and image bytes are processed as
+separate authenticated-stream frames rather than one size-limited manifest.
+Import uses encrypted staging, never decrypted temporary image files, and
+atomically replaces the atlas after complete authentication and validation.
+Legacy v1 JSON envelopes and v2 binary backups remain import-compatible.
