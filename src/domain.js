@@ -1,7 +1,7 @@
 import { fail } from './errors.js';
 
 export const CATEGORIES = Object.freeze([
-  'person', 'experience', 'goal', 'project', 'resource', 'relationship', 'preference',
+  'person', 'experience', 'goal', 'project', 'resource', 'relationship', 'interest',
 ]);
 export const CUSTOM_FIELD_TYPES = Object.freeze([
   'text', 'longText', 'number', 'boolean', 'date', 'url', 'singleChoice',
@@ -13,12 +13,18 @@ export const PROJECT_STATUSES = Object.freeze([
   'planned', 'active', 'paused', 'completed', 'abandoned',
 ]);
 export const GOAL_IMPORTANCES = Object.freeze(['low', 'medium', 'high']);
+export const INTEREST_KINDS = Object.freeze(['hobby', 'preference']);
+export const HOBBY_ENGAGEMENTS = Object.freeze(['casual', 'regular', 'serious', 'past']);
+export const HOBBY_SKILL_LEVELS = Object.freeze(['beginner', 'intermediate', 'advanced', 'expert']);
 
 const CATEGORY_SET = new Set(CATEGORIES);
 const FIELD_TYPE_SET = new Set(CUSTOM_FIELD_TYPES);
 const RELATIONSHIP_KIND_SET = new Set(RELATIONSHIP_KINDS);
 const PROJECT_STATUS_SET = new Set(PROJECT_STATUSES);
 const GOAL_IMPORTANCE_SET = new Set(GOAL_IMPORTANCES);
+const INTEREST_KIND_SET = new Set(INTEREST_KINDS);
+const HOBBY_ENGAGEMENT_SET = new Set(HOBBY_ENGAGEMENTS);
+const HOBBY_SKILL_LEVEL_SET = new Set(HOBBY_SKILL_LEVELS);
 const PARTIAL_DATE = /^(\d{4})(?:-(\d{2})(?:-(\d{2}))?)?$/;
 const PERSON_STRING_FIELDS = Object.freeze([
   'preferredName', 'gender', 'birthPlace', 'maritalStatus', 'address', 'summary', 'notes',
@@ -168,8 +174,27 @@ function validateCategoryData(category, data) {
   if (category === 'relationship' && !RELATIONSHIP_KIND_SET.has(data.kind)) {
     fail(400, 'VALIDATION_ERROR', `Relationship data.kind must be one of: ${RELATIONSHIP_KINDS.join(', ')}.`);
   }
-  if (category === 'preference' && !Object.hasOwn(data, 'value')) {
-    fail(400, 'VALIDATION_ERROR', 'Preference data.value is required.');
+  if (category === 'interest') {
+    if (!INTEREST_KIND_SET.has(data.kind)) {
+      fail(400, 'VALIDATION_ERROR', `Interest data.kind must be one of: ${INTEREST_KINDS.join(', ')}.`);
+    }
+    if (data.kind === 'preference' && !Object.hasOwn(data, 'value')) {
+      fail(400, 'VALIDATION_ERROR', 'Interest preference data.value is required.');
+    }
+    if (data.kind === 'hobby') {
+      for (const field of ['description', 'notes']) {
+        if (data[field] !== undefined && typeof data[field] !== 'string') {
+          fail(400, 'VALIDATION_ERROR', `Hobby ${field} must be a string.`);
+        }
+      }
+      if (data.engagement !== undefined && data.engagement !== '' && !HOBBY_ENGAGEMENT_SET.has(data.engagement)) {
+        fail(400, 'VALIDATION_ERROR', `Hobby engagement must be one of: ${HOBBY_ENGAGEMENTS.join(', ')}.`);
+      }
+      if (data.skillLevel !== undefined && data.skillLevel !== '' && !HOBBY_SKILL_LEVEL_SET.has(data.skillLevel)) {
+        fail(400, 'VALIDATION_ERROR', `Hobby skillLevel must be one of: ${HOBBY_SKILL_LEVELS.join(', ')}.`);
+      }
+      if (data.started !== undefined && data.started !== '') validatePartialDate(data.started, 'Hobby started');
+    }
   }
 }
 

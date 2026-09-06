@@ -240,11 +240,44 @@ const jsonObjectRequest = {
   required: true,
   content: { 'application/json': { schema: { type: 'object', additionalProperties: true } } },
 };
+const recordInputRequest = {
+  required: true,
+  content: { 'application/json': { schema: { $ref: '#/components/schemas/RecordInput' } } },
+};
+const recordPatchRequest = {
+  required: true,
+  content: { 'application/json': { schema: { $ref: '#/components/schemas/RecordPatch' } } },
+};
 const pathParameter = (name) => ({ name, in: 'path', required: true, schema: { type: 'string', minLength: 1 } });
 const queryParameter = (name, schema, description) => ({ name, in: 'query', required: false, schema, description });
 const localOperation = (operationId, tag, summary, description, responses, requestBody) => ({
   operationId, tags: [tag], summary, description, ...(requestBody ? { requestBody } : {}), responses,
 });
+
+const recordCategories = ['person', 'experience', 'goal', 'project', 'resource', 'relationship', 'interest'];
+const partialDate = { type: 'string', pattern: '^\\d{4}(?:-\\d{2}(?:-\\d{2})?)?$' };
+const interestPreferenceData = {
+  type: 'object', additionalProperties: true, required: ['kind', 'value'],
+  properties: {
+    kind: { type: 'string', const: 'preference' },
+    domain: { type: 'string', enum: ['work', 'communication', 'environment', 'food', 'style', 'other'] },
+    value: {},
+    strength: { type: 'string', enum: ['slight', 'moderate', 'strong'] },
+    context: { type: 'string' }, rationale: { type: 'string' },
+    effectiveFrom: partialDate, effectiveTo: partialDate,
+  },
+};
+const interestHobbyData = {
+  type: 'object', additionalProperties: true, required: ['kind'],
+  properties: {
+    kind: { type: 'string', const: 'hobby' },
+    description: { type: 'string' },
+    engagement: { type: 'string', enum: ['casual', 'regular', 'serious', 'past'] },
+    skillLevel: { type: 'string', enum: ['beginner', 'intermediate', 'advanced', 'expert'] },
+    started: partialDate,
+    notes: { type: 'string' },
+  },
+};
 
 export const BROWSER_OPENAPI_SPEC = Object.freeze({
   openapi: '3.1.0',
@@ -307,14 +340,14 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
           200: jsonResponse('Matching record summaries.', { type: 'array', items: { $ref: '#/components/schemas/Record' } }), 400: errorResponse, 423: errorResponse,
         }),
         parameters: [
-          queryParameter('category', { type: 'string' }, 'Optional record category.'),
+          queryParameter('category', { type: 'string', enum: recordCategories }, 'Optional record category.'),
           queryParameter('q', { type: 'string' }, 'Optional case-insensitive search across decrypted record content.'),
           queryParameter('trashed', { type: 'string', enum: ['false', 'true', 'all'], default: 'false' }, 'Select active, trashed, or all records.'),
         ],
       },
       post: localOperation('create_record', 'Records', 'Create a typed record', 'Creates a category-specific encrypted record. Goal hierarchy fields are accepted only for Goal records.', {
         201: jsonResponse('Created record.', { $ref: '#/components/schemas/Record' }), ...unlockedErrors,
-      }, jsonObjectRequest),
+      }, recordInputRequest),
     },
     '/api/records/{id}': {
       parameters: [pathParameter('id')],
@@ -323,7 +356,7 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
       }),
       patch: localOperation('patch_record', 'Records', 'Update a record', 'Applies an optimistic record edit using the supplied revision and category-specific fields.', {
         200: jsonResponse('Updated record.', { $ref: '#/components/schemas/Record' }), ...unlockedErrors,
-      }, jsonObjectRequest),
+      }, recordPatchRequest),
       delete: localOperation('trash_record', 'Records', 'Move a record to Recently removed', 'Optimistically trashes a record using the required current revision. Goal hierarchy restrictions still apply.', {
         200: jsonResponse('Trashed record.', { $ref: '#/components/schemas/Record' }), ...unlockedErrors,
       }, { required: true, content: { 'application/json': { schema: { $ref: '#/components/schemas/RevisionRequest' } } } }),
@@ -419,7 +452,7 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
         ...localOperation('list_custom_fields', 'Custom fields', 'List custom field definitions', 'Lists custom field definitions, optionally restricted to one record category.', {
           200: jsonResponse('Custom field definitions.', { type: 'array', items: { type: 'object' } }), 423: errorResponse,
         }),
-        parameters: [queryParameter('category', { type: 'string' }, 'Optional record category.')],
+        parameters: [queryParameter('category', { $ref: '#/components/schemas/RecordCategory' }, 'Optional record category.')],
       },
       post: localOperation('create_custom_field', 'Custom fields', 'Create a custom field', 'Creates a typed custom field definition for one record category.', {
         201: jsonResponse('Created custom field.', { type: 'object' }), ...unlockedErrors,
@@ -492,7 +525,57 @@ export const BROWSER_OPENAPI_SPEC = Object.freeze({
         type: 'object', additionalProperties: false, required: ['revision'],
         properties: { revision: { type: 'integer', minimum: 1 } },
       },
-      Record: { type: 'object', additionalProperties: true },
+      RecordCategory: { type: 'string', enum: recordCategories },
+      InterestHobbyData: interestHobbyData,
+      InterestPreferenceData: interestPreferenceData,
+      InterestData: {
+        oneOf: [
+          { $ref: '#/components/schemas/InterestHobbyData' },
+          { $ref: '#/components/schemas/InterestPreferenceData' },
+        ],
+        discriminator: { propertyName: 'kind', mapping: {
+          hobby: '#/components/schemas/InterestHobbyData',
+          preference: '#/components/schemas/InterestPreferenceData',
+        } },
+      },
+      RecordInput: {
+        type: 'object', additionalProperties: true, required: ['category', 'title', 'data'],
+        properties: {
+          category: { $ref: '#/components/schemas/RecordCategory' },
+          title: { type: 'string', minLength: 1 },
+          data: { type: 'object', additionalProperties: true, description: 'Interest records use InterestData with kind hobby or preference.' },
+          customFieldValues: { type: 'object', additionalProperties: true },
+          parentId: { type: ['string', 'null'] }, position: { type: 'integer', minimum: 0 },
+        },
+      },
+      RecordPatch: {
+        type: 'object', additionalProperties: true, required: ['revision'],
+        properties: {
+          revision: { type: 'integer', minimum: 1 },
+          title: { type: 'string', minLength: 1 },
+          data: { type: 'object', additionalProperties: true, description: 'Interest records use InterestData with kind hobby or preference.' },
+          customFieldValues: { type: 'object', additionalProperties: true },
+          parentId: { type: ['string', 'null'] }, position: { type: 'integer', minimum: 0 },
+        },
+      },
+      InterestRecord: {
+        type: 'object', additionalProperties: true, required: ['category', 'title', 'data'],
+        properties: {
+          category: { type: 'string', const: 'interest' },
+          title: { type: 'string' }, data: { $ref: '#/components/schemas/InterestData' },
+        },
+      },
+      Record: {
+        type: 'object', additionalProperties: true,
+        properties: {
+          category: { $ref: '#/components/schemas/RecordCategory' },
+          title: { type: 'string' }, data: { type: 'object', additionalProperties: true },
+          customFieldValues: { type: 'object', additionalProperties: true },
+          parentId: { type: ['string', 'null'] }, position: { type: 'integer', minimum: 0 },
+          revision: { type: 'integer', minimum: 1 }, trashed: { type: 'boolean' },
+          createdAt: { type: 'string', format: 'date-time' }, updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
     },
   },
 });

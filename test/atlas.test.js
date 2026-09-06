@@ -26,7 +26,8 @@ async function fixture(t) {
 }
 
 function create(atlas, category, title, data, extra = {}) {
-  return atlas.createRecord({ category, title, data, customFieldValues: {}, ...extra });
+  const normalizedData = category === 'interest' ? { kind: 'preference', ...data } : data;
+  return atlas.createRecord({ category, title, data: normalizedData, customFieldValues: {}, ...extra });
 }
 
 test('category contracts and person singleton are enforced', async (t) => {
@@ -47,7 +48,19 @@ test('category contracts and person singleton are enforced', async (t) => {
   assert.throws(() => create(atlas, 'resource', 'Cash', { quantity: 1, value: 10 }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'relationship', 'Unknown', { kind: 'place' }), { code: 'VALIDATION_ERROR' });
   assert.throws(() => create(atlas, 'relationship', 'Old person kind', { kind: 'person' }), { code: 'VALIDATION_ERROR' });
-  assert.throws(() => create(atlas, 'preference', 'Theme', {}), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => atlas.createRecord({ category: 'interest', title: 'Missing kind', data: {} }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => atlas.createRecord({ category: 'preference', title: 'Legacy category', data: { value: 'dark' } }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'interest', 'Preference without value', {}), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'interest', 'Bad hobby engagement', { kind: 'hobby', engagement: 'sometimes' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'interest', 'Bad hobby skill', { kind: 'hobby', skillLevel: 'master' }), { code: 'VALIDATION_ERROR' });
+  assert.throws(() => create(atlas, 'interest', 'Bad hobby date', { kind: 'hobby', started: '2026-02-30' }), { code: 'VALIDATION_ERROR' });
+  assert.deepEqual(create(atlas, 'interest', 'Tennis', { kind: 'hobby' }).data, { kind: 'hobby' });
+  const hobby = create(atlas, 'interest', 'Photography', {
+    kind: 'hobby', description: 'Street photography', engagement: 'regular', skillLevel: 'advanced', started: '2020-05', notes: 'Local photo walks',
+  });
+  assert.equal(hobby.category, 'interest');
+  assert.equal(hobby.data.kind, 'hobby');
+  assert.equal(hobby.data.started, '2020-05');
   assert.equal(create(atlas, 'experience', 'Launch', { kind: 'event', startDate: '2026-08-04' }).revision, 1);
   const project = create(atlas, 'project', 'Atlas', { context: '', status: 'active', githubLink: 'https://github.com/example/atlas' });
   assert.equal(project.category, 'project');
@@ -103,6 +116,58 @@ test('unlock migrates the removed person relationship kind to family once', asyn
   atlas.lock();
   await atlas.unlock(APP_PASSPHRASE);
   assert.equal(atlas.getRecord(relationship.id).revision, 2);
+});
+
+test('unlock migrates legacy Preference records, history, and custom fields into Interest', async (t) => {
+  const { atlas } = await fixture(t);
+  const oldCategory = 'preference';
+  const recordId = 'legacy-preference-record';
+  const fieldId = 'legacy-preference-field';
+  const createdAt = '2026-01-01T00:00:00.000Z';
+  const updatedAt = '2026-01-02T00:00:00.000Z';
+  const config = JSON.parse(atlas.database.prepare("SELECT value FROM metadata WHERE key = 'encryption-config'").get().value);
+  const salt = Buffer.from(config.salt, 'base64');
+  delete config.salt;
+  const key = await deriveKey(APP_PASSPHRASE, salt, config);
+  const previousData = { domain: 'style', value: 'light', strength: 'moderate', rationale: 'Earlier choice' };
+  const currentData = { domain: 'style', value: 'dark', strength: 'strong', rationale: 'Current choice' };
+  const customFieldValues = { [fieldId]: 'Preserve this value' };
+  const snapshot = (revision, data) => ({
+    category: oldCategory, title: 'Theme', data, customFieldValues,
+    parentId: null, position: 0, trashed: false, revision,
+  });
+  atlas.database.prepare(`INSERT INTO custom_fields(id, category, type, created_at, updated_at, payload)
+    VALUES (?, ?, ?, ?, ?, ?)`).run(fieldId, oldCategory, 'text', createdAt, updatedAt,
+    encryptJson(key, { name: 'Legacy note', options: [] }, objectAad('custom-field', fieldId, 1, oldCategory)));
+  atlas.database.prepare(`INSERT INTO records
+    (id, category, revision, trashed, parent_id, position, created_at, updated_at, payload)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(recordId, oldCategory, 2, 0, null, 0, createdAt, updatedAt,
+    encryptJson(key, { title: 'Theme', data: currentData, customFieldValues }, objectAad('record', recordId, 2, oldCategory)));
+  for (const [revision, data, timestamp] of [[1, previousData, createdAt], [2, currentData, updatedAt]]) {
+    atlas.database.prepare(`INSERT INTO record_revisions(record_id, revision, category, created_at, payload)
+      VALUES (?, ?, ?, ?, ?)`).run(recordId, revision, oldCategory, timestamp,
+      encryptJson(key, snapshot(revision, data), objectAad('revision', recordId, revision, oldCategory)));
+  }
+  key.fill(0);
+
+  atlas.lock();
+  await atlas.unlock(APP_PASSPHRASE);
+  const migrated = atlas.getRecord(recordId);
+  assert.equal(migrated.category, 'interest');
+  assert.deepEqual(migrated.data, { ...currentData, kind: 'preference' });
+  assert.equal(migrated.customFieldValues[fieldId], 'Preserve this value');
+  assert.equal(migrated.revision, 2);
+  assert.deepEqual(atlas.listRevisions(recordId).map((item) => [item.category, item.data.kind, item.data.value]), [
+    ['interest', 'preference', 'dark'], ['interest', 'preference', 'light'],
+  ]);
+  assert.deepEqual(atlas.listCustomFields({ category: 'interest' }).map(({ category, name }) => [category, name]), [['interest', 'Legacy note']]);
+  assert.equal(atlas.database.prepare("SELECT COUNT(*) AS count FROM records WHERE category = 'preference'").get().count, 0);
+  assert.equal(atlas.database.prepare("SELECT COUNT(*) AS count FROM record_revisions WHERE category = 'preference'").get().count, 0);
+  assert.equal(atlas.database.prepare("SELECT COUNT(*) AS count FROM custom_fields WHERE category = 'preference'").get().count, 0);
+
+  atlas.lock();
+  await atlas.unlock(APP_PASSPHRASE);
+  assert.equal(atlas.getRecord(recordId).revision, 2);
 });
 
 test('unlock purges legacy goal text fields into description across current data and history', async (t) => {
@@ -203,7 +268,7 @@ test('opening Atlas purges the retired agent-key verifier metadata', async (t) =
 test('user content is encrypted and tampering and wrong passphrases fail closed', async (t) => {
   const { atlas, databasePath } = await fixture(t);
   const sentinel = 'PLAINTEXT_SENTINEL_9dca8f';
-  const record = create(atlas, 'preference', sentinel, { value: `value-${sentinel}` });
+  const record = create(atlas, 'interest', sentinel, { value: `value-${sentinel}` });
   atlas.database.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   const bytes = await readFile(databasePath);
   assert.equal(bytes.includes(Buffer.from(sentinel)), false);
@@ -219,7 +284,7 @@ test('user content is encrypted and tampering and wrong passphrases fail closed'
 
 test('locking removes access to protected operations', async (t) => {
   const { atlas } = await fixture(t);
-  create(atlas, 'preference', 'Theme', { value: 'dark' });
+  create(atlas, 'interest', 'Theme', { value: 'dark' });
   atlas.lock();
   assert.throws(() => atlas.listRecords(), { status: 423, code: 'LOCKED' });
   assert.deepEqual(atlas.status(), { initialized: true, locked: true });
@@ -237,7 +302,7 @@ test('lifecycle transitions serialize setup and invalidate an unlock overtaken b
   assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
   assert.equal(results.find((result) => result.status === 'rejected').reason.code, 'ALREADY_INITIALIZED');
   const winningPassphrase = results[0].status === 'fulfilled' ? APP_PASSPHRASE : alternatePassphrase;
-  const record = create(atlas, 'preference', 'Still decryptable', { value: 'after concurrent setup' });
+  const record = create(atlas, 'interest', 'Still decryptable', { value: 'after concurrent setup' });
   atlas.lock();
   const pendingUnlock = atlas.unlock(winningPassphrase);
   await new Promise((resolvePromise) => setImmediate(resolvePromise));
@@ -306,8 +371,8 @@ test('database lease is exclusive across Atlas processes', async (t) => {
 
 test('clear all verifies the current passphrase and returns Atlas to first-time setup', async (t) => {
   const { atlas } = await fixture(t);
-  const record = create(atlas, 'preference', 'Keep until authenticated', { value: 'private' });
-  atlas.createCustomField({ category: 'preference', name: 'Private note', type: 'text' });
+  const record = create(atlas, 'interest', 'Keep until authenticated', { value: 'private' });
+  atlas.createCustomField({ category: 'interest', name: 'Private note', type: 'text' });
   const staged = await atlas.stageImportUpload([Buffer.from('staged encrypted backup')]);
 
   await assert.rejects(atlas.clearAll('this is the wrong passphrase'), { code: 'INVALID_PASSPHRASE' });
@@ -427,7 +492,7 @@ test('subgoal creation is transactional and idempotent with prerequisite edges',
 
 test('optimistic edits, no-ops, revisions, and historical restore work', async (t) => {
   const { atlas } = await fixture(t);
-  const original = create(atlas, 'preference', 'Theme', { value: 'dark' });
+  const original = create(atlas, 'interest', 'Theme', { value: 'dark' });
   const noOp = atlas.patchRecord(original.id, { revision: 1 });
   assert.equal(noOp.revision, 1);
   const edited = atlas.patchRecord(original.id, { revision: 1, title: 'Color theme' });
@@ -458,7 +523,7 @@ test('typed custom fields and encrypted links are included in record detail', as
   assert.equal(renamed.title, 'Me again');
   assert.throws(() => atlas.patchRecord(person.id, { revision: renamed.revision,
     customFieldValues: { [field.id]: 'green' } }), { code: 'VALIDATION_ERROR' });
-  const preference = create(atlas, 'preference', 'Color', { value: 'blue' });
+  const preference = create(atlas, 'interest', 'Color', { value: 'blue' });
   const link = atlas.createLink({ sourceId: person.id, targetId: preference.id, type: 'supports', label: 'explains', notes: 'private note' });
   assert.equal(atlas.getRecord(person.id).links[0].label, 'explains');
   assert.equal(atlas.getRecord(preference.id).backlinks[0].id, link.id);
@@ -475,11 +540,11 @@ test('typed custom fields and encrypted links are included in record detail', as
 
 test('custom field edits preserve unique names and restorable revision values', async (t) => {
   const { atlas } = await fixture(t);
-  const choice = atlas.createCustomField({ category: 'preference', name: 'Choice', type: 'singleChoice', options: ['old', 'new'] });
-  const other = atlas.createCustomField({ category: 'preference', name: 'Other', type: 'text' });
+  const choice = atlas.createCustomField({ category: 'interest', name: 'Choice', type: 'singleChoice', options: ['old', 'new'] });
+  const other = atlas.createCustomField({ category: 'interest', name: 'Other', type: 'text' });
   assert.throws(() => atlas.patchCustomField(other.id, { name: 'cHoIcE' }), { code: 'CUSTOM_FIELD_EXISTS' });
 
-  const original = atlas.createRecord({ category: 'preference', title: 'Setting', data: { value: 'example' },
+  const original = atlas.createRecord({ category: 'interest', title: 'Setting', data: { kind: 'preference', value: 'example' },
     customFieldValues: { [choice.id]: 'old' } });
   atlas.patchRecord(original.id, { revision: original.revision, customFieldValues: { [choice.id]: 'new' } });
   assert.throws(() => atlas.patchCustomField(choice.id, { options: ['new'] }), { code: 'VALIDATION_ERROR' });
@@ -506,8 +571,8 @@ test('unused custom fields are deleted rather than archived', async (t) => {
 
 test('empty trash permanently deletes records and cascades their related data', async (t) => {
   const { atlas } = await fixture(t);
-  const removed = create(atlas, 'preference', 'Temporary', { value: 'remove me' });
-  const retained = create(atlas, 'preference', 'Keep', { value: 'stay' });
+  const removed = create(atlas, 'interest', 'Temporary', { value: 'remove me' });
+  const retained = create(atlas, 'interest', 'Keep', { value: 'stay' });
   const parent = create(atlas, 'goal', 'Removed parent', { horizon: 'short' });
   const child = create(atlas, 'goal', 'Removed child', { horizon: 'short' }, { parentId: parent.id });
   atlas.createLink({ sourceId: retained.id, targetId: removed.id, label: 'temporary link' });
@@ -605,7 +670,7 @@ test('framed v3 backups exceed the legacy manifest ceiling and import incrementa
   const source = await fixture(t);
   const value = 'x'.repeat(512 * 1024);
   for (let index = 0; index < 17; index += 1) {
-    create(source.atlas, 'preference', `Large preference ${index}`, { value });
+    create(source.atlas, 'interest', `Large preference ${index}`, { value });
   }
   const exported = await source.atlas.exportV3(BACKUP_PASSPHRASE);
   const backup = await collect(exported.stream);
@@ -617,10 +682,10 @@ test('framed v3 backups exceed the legacy manifest ceiling and import incrementa
   assert.deepEqual(await destination.atlas.commitImportUpload(staged.uploadId, BACKUP_PASSPHRASE), {
     imported: true, records: 17, images: 0,
   });
-  assert.equal(destination.atlas.listRecords({ category: 'preference' }).length, 17);
-  assert.equal(destination.atlas.listRecords({ category: 'preference' })[0].data.value.length, value.length);
+  assert.equal(destination.atlas.listRecords({ category: 'interest' }).length, 17);
+  assert.equal(destination.atlas.listRecords({ category: 'interest' })[0].data.value.length, value.length);
 
-  const retained = create(destination.atlas, 'preference', 'Retained after tamper', { value: true });
+  const retained = create(destination.atlas, 'interest', 'Retained after tamper', { value: true });
   const tampered = Buffer.from(backup);
   tampered[tampered.length - 32] ^= 0xff;
   const badStage = await destination.atlas.stageImportUpload([tampered]);
@@ -648,7 +713,7 @@ test('streamed v2 backup round-trips images and rejects tampering atomically', a
   assert.equal(backup.length, exported.byteLength);
 
   const destination = await fixture(t);
-  const preserved = create(destination.atlas, 'preference', 'Preserved before import', { value: true });
+  const preserved = create(destination.atlas, 'interest', 'Preserved before import', { value: true });
   const staged = await destination.atlas.stageImportUpload([backup]);
   const result = await destination.atlas.commitImportUpload(staged.uploadId, BACKUP_PASSPHRASE);
   assert.deepEqual(result, { imported: true, records: 1, images: 1 });
@@ -659,7 +724,7 @@ test('streamed v2 backup round-trips images and rejects tampering atomically', a
   importedContent.bytes.fill(0);
   assert.throws(() => destination.atlas.listImages(preserved.id), { code: 'RECORD_NOT_FOUND' });
 
-  const keep = create(destination.atlas, 'preference', 'Keep after tamper', { value: 'unchanged' });
+  const keep = create(destination.atlas, 'interest', 'Keep after tamper', { value: 'unchanged' });
   const tampered = Buffer.from(backup);
   tampered[tampered.length - 20] ^= 0xff;
   const badStage = await destination.atlas.stageImportUpload([tampered]);
@@ -678,8 +743,8 @@ test('streamed v2 backup round-trips images and rejects tampering atomically', a
 
 test('global search covers encrypted nested content without exposing trashed records by default', async (t) => {
   const { atlas } = await fixture(t);
-  const first = create(atlas, 'preference', 'Editor', { value: { theme: 'Solarized Dark' } });
-  const second = create(atlas, 'preference', 'Other', { value: 'plain' });
+  const first = create(atlas, 'interest', 'Editor', { value: { theme: 'Solarized Dark' } });
+  const second = create(atlas, 'interest', 'Other', { value: 'plain' });
   atlas.trashRecord(second.id, second.revision);
   assert.deepEqual(atlas.listRecords({ q: 'SOLARIZED' }).map((record) => record.id), [first.id]);
   assert.equal(atlas.listRecords().length, 1);
@@ -688,10 +753,10 @@ test('global search covers encrypted nested content without exposing trashed rec
 
 test('portable encrypted import validates before atomic replacement', async (t) => {
   const source = await fixture(t);
-  create(source.atlas, 'preference', 'Source', { value: 'portable' });
+  create(source.atlas, 'interest', 'Source', { value: 'portable' });
   const envelope = await source.atlas.export(BACKUP_PASSPHRASE);
   const destination = await fixture(t);
-  const preserved = create(destination.atlas, 'preference', 'Preserved', { value: true });
+  const preserved = create(destination.atlas, 'interest', 'Preserved', { value: true });
   await destination.atlas.import(BACKUP_PASSPHRASE, envelope);
   assert.equal(destination.atlas.listRecords()[0].title, 'Source');
   const snapshot = await openBackupEnvelope(BACKUP_PASSPHRASE, envelope);
@@ -722,7 +787,7 @@ test('HTTP reset requires the current passphrase and supports clean setup afterw
   const { mkdir } = await import('node:fs/promises');
   await mkdir(publicDir);
   await writeFile(join(publicDir, 'index.html'), '<!doctype html><title>Atlas</title>');
-  create(atlas, 'preference', 'Server-side reset sentinel', { value: true });
+  create(atlas, 'interest', 'Server-side reset sentinel', { value: true });
   const server = createServer({ atlas, publicDir });
   const address = await listen(server, { port: 0 });
   t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
@@ -845,7 +910,7 @@ test('HTTP buffers split UTF-8, applies limits, stable errors, lock status, and 
   const address = await listen(server, { port: 0 });
   t.after(() => new Promise((resolvePromise) => server.close(resolvePromise)));
   const port = address.port;
-  const encoded = Buffer.from(JSON.stringify({ category: 'preference', title: 'Café', data: { value: 'é' }, customFieldValues: {} }));
+  const encoded = Buffer.from(JSON.stringify({ category: 'interest', title: 'Café', data: { kind: 'preference', value: 'é' }, customFieldValues: {} }));
   const split = encoded.indexOf(Buffer.from('é')) + 1;
   const created = await rawRequest(port, { method: 'POST', path: '/api/records', headers: { 'content-type': 'application/json' }, chunks: [encoded.subarray(0, split), encoded.subarray(split)] });
   assert.equal(created.status, 201);
@@ -861,7 +926,7 @@ test('HTTP buffers split UTF-8, applies limits, stable errors, lock status, and 
   const locked = await rawRequest(port, { path: '/api/records' });
   assert.equal(locked.status, 423);
   assert.deepEqual(Object.keys(JSON.parse(locked.body)), ['error']);
-  const spa = await rawRequest(port, { path: '/preferences' });
+  const spa = await rawRequest(port, { path: '/interests' });
   assert.equal(spa.status, 200);
   assert.match(spa.body.toString(), /Atlas/);
 });

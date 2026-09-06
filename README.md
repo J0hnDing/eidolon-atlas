@@ -9,7 +9,7 @@ connected kinds of information in one place:
 - Project
 - Resource
 - Relationships
-- Preference
+- Interest (Hobbies and Preferences)
 - Knowledge
 
 The application runs on `127.0.0.1`, stores its data in SQLite, and encrypts

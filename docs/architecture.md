@@ -12,7 +12,7 @@ flowchart LR
 ```
 
 The browser routes Experience, Goal, Project, Resource, and Relationship
-details to full-page views; Person and Preference details remain drawer views.
+details to full-page views; Person and Interest details remain drawer views.
 
 ## Boundaries
 

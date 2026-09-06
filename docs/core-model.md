@@ -74,10 +74,20 @@ owner's relationship type, status, importance, dates, contact details, and
 notes. Shared experiences and projects are ordinary links. The Relationships
 landing page presents these categories before opening an individual category.
 
-### Preference
+### Interest
 
-A Preference records a contextual inclination: its domain, statement,
-strength, rationale, and optional effective dates.
+Interest is the top-level workspace for Hobbies and Preferences. Every
+Interest record has a required `kind` of `hobby` or `preference`.
+
+A Hobby uses its title as a concise name and may include a description,
+engagement (`casual`, `regular`, `serious`, or `past`), self-assessed skill
+level (`beginner`, `intermediate`, `advanced`, or `expert`), a partial `started`
+date, and notes about equipment, routines, communities, goals, or other useful
+context. The engagement, skill level, and start date are optional.
+
+A Preference keeps its existing semantics: it records a contextual inclination
+through its domain, preferred value, strength, context, rationale, and optional
+effective dates.
 
 ## Links and custom fields
 
@@ -111,7 +121,7 @@ their Experience is in trash and return when it is restored.
 ## Navigation
 
 Experience, Goal, Project, Resource, and Relationship records open on routed
-full-page detail views. Person and Preference records continue to use the
+full-page detail views. Person and Interest records continue to use the
 workspace drawer.
 
 ## Dates

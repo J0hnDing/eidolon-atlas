@@ -7,7 +7,7 @@ const CATEGORIES = {
   project: { label: "Project", plural: "Projects", icon: "layers", accent: "#6c6f85", eyebrow: "Work in motion", description: "A clear inventory of what you are making and its present state." },
   resource: { label: "Resource", plural: "Resources", icon: "bookmark", accent: "#8b704c", eyebrow: "Assets & capacity", description: "Wealth, capital, assets, accounts, capabilities, and other resources you can draw on." },
   relationship: { label: "Relationship", plural: "Relationships", icon: "link", accent: "#8b5f6a", eyebrow: "People & organizations", description: "The connections that shape your personal and professional world." },
-  preference: { label: "Preference", plural: "Preferences", icon: "preference", accent: "#5d7774", eyebrow: "Taste & defaults", description: "Choices, boundaries, and defaults you want to remember." }
+  interest: { label: "Interest", plural: "Interests", icon: "spark", accent: "#5d7774", eyebrow: "Hobbies & preferences", description: "The activities, tastes, and patterns that make your life yours." }
 };
 
 const RELATIONSHIP_KINDS = [
@@ -20,6 +20,11 @@ const RELATIONSHIP_KINDS = [
   { value: "org", label: "Organizations", icon: "bookmark", accent: "#8b704c", description: "Companies, communities, institutions, and other organizations." }
 ];
 const RELATIONSHIP_KIND_BY_VALUE = new Map(RELATIONSHIP_KINDS.map((kind) => [kind.value, kind]));
+const INTEREST_KINDS = [
+  { value: "hobby", label: "Hobbies", singular: "Hobby", icon: "spark", accent: "#806149", description: "Activities and pursuits you make time for, whether casually or seriously." },
+  { value: "preference", label: "Preferences", singular: "Preference", icon: "preference", accent: "#5d7774", description: "Choices, boundaries, and defaults you want to remember." }
+];
+const INTEREST_KIND_BY_VALUE = new Map(INTEREST_KINDS.map((kind) => [kind.value, kind]));
 
 const FIELD_DEFS = {
   person: [
@@ -79,9 +84,18 @@ const FIELD_DEFS = {
     ["endDate", "Ended", "partial", false, "YYYY, YYYY-MM, or YYYY-MM-DD"],
     ["contact", "Contact details", "textarea", false, "Useful contact context"],
     ["notes", "Context", "textarea", false, "Useful relationship context"]
+  ]
+};
+
+const INTEREST_FIELD_DEFS = {
+  hobby: [
+    ["description", "Description", "textarea", false, "What this hobby involves for you"],
+    ["engagement", "Engagement", "select", false, "", [["casual", "Casual"], ["regular", "Regular"], ["serious", "Serious"], ["past", "Past"]]],
+    ["skillLevel", "Skill level", "select", false, "", [["beginner", "Beginner"], ["intermediate", "Intermediate"], ["advanced", "Advanced"], ["expert", "Expert"]]],
+    ["started", "Started", "partial", false, "YYYY, YYYY-MM, or YYYY-MM-DD"],
+    ["notes", "Notes", "textarea", false, "Equipment, routines, communities, or goals"]
   ],
   preference: [
-    ["title", "Preference", "text", true, "A memorable label"],
     ["domain", "Area", "select", false, "", [["work", "Work"], ["communication", "Communication"], ["environment", "Environment"], ["food", "Food"], ["style", "Style"], ["other", "Other"]]],
     ["value", "Preferred choice", "text", true, "What works best"],
     ["strength", "Strength", "select", false, "", [["slight", "Slight"], ["moderate", "Moderate"], ["strong", "Strong"]]],
@@ -91,12 +105,13 @@ const FIELD_DEFS = {
     ["effectiveTo", "Effective to", "partial", false, "YYYY, YYYY-MM, or YYYY-MM-DD"]
   ]
 };
+const INTEREST_KIND_FIELD = ["kind", "Type", "select", true, "", INTEREST_KINDS.map(({ value, singular }) => [value, singular])];
 
 const FILTERS = {
   project: ["all", "planned", "active", "paused", "completed", "abandoned"],
   resource: ["all", "available", "limited", "unavailable"],
   relationship: RELATIONSHIP_KINDS.map(({ value }) => value),
-  preference: ["all", "work", "communication", "environment", "food", "style", "other"]
+  interest: ["all", "hobby", "preference"]
 };
 
 const ICONS = {
@@ -146,8 +161,9 @@ const PERSON_PROFILE_GROUPS = [
 ];
 const PERSON_KEYS = new Set(FIELD_DEFS.person.map(([key]) => key).filter((key) => key !== "title").concat([...PERSON_SENSITIVE_KEYS]));
 const FULL_PAGE_CATEGORIES = new Set(["experience", "goal", "project", "resource", "relationship"]);
-const ROUTE_PLURALS = { person: "person", experience: "experiences", goal: "goals", project: "projects", resource: "resources", relationship: "relationships", preference: "preferences" };
+const ROUTE_PLURALS = { person: "person", experience: "experiences", goal: "goals", project: "projects", resource: "resources", relationship: "relationships", interest: "interests" };
 const ROUTE_SINGULARS = Object.fromEntries(Object.entries(ROUTE_PLURALS).map(([key, value]) => [value, key]));
+const LEGACY_ROUTE_ALIASES = { preference: "interest", preferences: "interest" };
 
 const state = {
   category: "person",
@@ -344,6 +360,18 @@ function relationshipKind(value) {
   return RELATIONSHIP_KIND_BY_VALUE.get(value);
 }
 
+function interestKind(value) {
+  return INTEREST_KIND_BY_VALUE.get(value);
+}
+
+function interestDefinitions(kind) {
+  return [INTEREST_KIND_FIELD, ...(INTEREST_FIELD_DEFS[kind] || INTEREST_FIELD_DEFS.hobby)];
+}
+
+function recordFieldDefinitions(category, data = {}) {
+  return category === "interest" ? interestDefinitions(data.kind || "hobby") : FIELD_DEFS[category] || [];
+}
+
 function formatDate(value) {
   if (!value) return "Not set";
   const raw = String(value);
@@ -475,10 +503,10 @@ function routeFromLocation() {
   if (parts[0] === "search") return { kind: "search", query: new URLSearchParams(window.location.search).get("q")?.trim() || "" };
   if (parts[0] === "trash" || parts[0] === "recently-removed") return { kind: "trash", category: state.category || "person" };
   if (parts[0] === "list" && parts[1]) {
-    const listedCategory = ROUTE_SINGULARS[parts[1]] || (CATEGORIES[parts[1]] ? parts[1] : null);
+    const listedCategory = ROUTE_SINGULARS[parts[1]] || LEGACY_ROUTE_ALIASES[parts[1]] || (CATEGORIES[parts[1]] ? parts[1] : null);
     if (listedCategory) return parts[2] ? { kind: "detail", category: listedCategory, id: parts.slice(2).join("/") } : { kind: "list", category: listedCategory };
   }
-  const category = ROUTE_SINGULARS[parts[0]] || (parts[0] && CATEGORIES[parts[0]] ? parts[0] : null);
+  const category = ROUTE_SINGULARS[parts[0]] || LEGACY_ROUTE_ALIASES[parts[0]] || (parts[0] && CATEGORIES[parts[0]] ? parts[0] : null);
   if (category) {
     if (parts[1]) return { kind: "detail", category, id: parts.slice(1).join("/") };
     const params = new URLSearchParams(window.location.search);
@@ -554,7 +582,6 @@ async function applyRoute(route) {
     $("#view-heading")?.classList?.add("route-hidden");
     $("#filter-bar").replaceChildren();
     $("#new-record").hidden = true;
-    $("#new-record-top").hidden = true;
     await openFullPageDetail(route.id);
     return;
   }
@@ -568,13 +595,12 @@ async function applyRoute(route) {
 function updateHeading() {
   const meta = CATEGORIES[state.category];
   const relationshipMeta = state.category === "relationship" ? relationshipKind(state.filter) : null;
-  $("#view-eyebrow").textContent = state.trash ? "Recover or remove" : state.query ? "Across every workspace" : relationshipMeta ? "Relationships" : meta.eyebrow;
-  $("#view-title").textContent = state.trash ? "Recently removed" : state.query ? "Search results" : relationshipMeta?.label || meta.plural;
-  $("#view-description").textContent = state.trash ? "Restore entries you still need, or clean them up permanently." : state.query ? `Matches for “${state.query}”` : relationshipMeta?.description || meta.description;
+  const interestMeta = state.category === "interest" && state.filter !== "all" ? interestKind(state.filter) : null;
+  $("#view-eyebrow").textContent = state.trash ? "Recover or remove" : state.query ? "Across every workspace" : relationshipMeta ? "Relationships" : interestMeta ? "Interests" : meta.eyebrow;
+  $("#view-title").textContent = state.trash ? "Recently removed" : state.query ? "Search results" : relationshipMeta?.label || interestMeta?.label || meta.plural;
+  $("#view-description").textContent = state.trash ? "Restore entries you still need, or clean them up permanently." : state.query ? `Matches for “${state.query}”` : relationshipMeta?.description || interestMeta?.description || meta.description;
   $("#new-record").hidden = state.trash || Boolean(state.query);
-  $("#new-record-top").hidden = state.trash;
   $("#new-record span:last-child").textContent = "Add entry";
-  $("#new-record-top .button-label").textContent = "Add entry";
   $("#empty-trash").hidden = true;
   $$(".category-nav .nav-row").forEach((button) => {
     const active = !state.trash && !state.query && button.dataset.category === state.category;
@@ -584,7 +610,8 @@ function updateHeading() {
   $("[data-workspace='knowledge']")?.classList.remove("active");
   $("#settings-button")?.classList.toggle("active", state.trash);
   const canToggle = !state.trash && !state.query && !["experience", "goal", "person"].includes(state.category) &&
-    !(state.category === "relationship" && state.filter === "all");
+    !(state.category === "relationship" && state.filter === "all") &&
+    !(state.category === "interest" && state.filter === "all");
   $("#view-toggle").hidden = !canToggle;
   $$("#view-toggle button").forEach((button) => {
     const active = button.dataset.view === state.view;
@@ -608,7 +635,8 @@ function renderFilters() {
   }
   const choices = state.trash || state.query ? [] : FILTERS[state.category] || [];
   choices.forEach((value) => {
-    bar.append(element("button", { class: `filter-chip${state.filter === value ? " active" : ""}`, type: "button", text: friendly(value), onclick: () => navigateTo({ kind: "list", category: state.category, filter: value, view: state.view }, { replace: true }) }));
+    const label = state.category === "interest" ? (value === "all" ? "All interests" : interestKind(value)?.label || friendly(value)) : friendly(value);
+    bar.append(element("button", { class: `filter-chip${state.filter === value ? " active" : ""}`, type: "button", text: label, onclick: () => navigateTo({ kind: "list", category: state.category, filter: value, view: state.view }, { replace: true }) }));
   });
 }
 
@@ -645,7 +673,7 @@ async function loadCategory() {
 
 function filteredRecords() {
   if (state.filter === "all" || state.trash || state.query) return state.records;
-  const key = state.category === "relationship" ? "kind" : state.category === "preference" ? "domain" : state.category === "resource" ? "availability" : "status";
+  const key = ["relationship", "interest"].includes(state.category) ? "kind" : state.category === "resource" ? "availability" : "status";
   return state.records.filter((record) => record.data?.[key] === state.filter);
 }
 
@@ -655,10 +683,12 @@ function renderRecords() {
   const records = filteredRecords();
   const personExists = !state.trash && !state.query && state.category === "person" && records.length > 0;
   $("#new-record").hidden = state.trash || Boolean(state.query) || personExists;
-  $("#new-record-top").hidden = state.trash || personExists;
   $("#empty-trash").hidden = !state.trash || records.length === 0;
   if (!state.trash && !state.query && state.category === "relationship" && state.filter === "all") {
     return stage.append(renderRelationshipOverview(state.records));
+  }
+  if (!state.trash && !state.query && state.category === "interest" && state.filter === "all") {
+    return stage.append(renderInterestOverview(state.records));
   }
   if (!records.length) return stage.append(renderEmpty());
   if (state.trash || state.query) return stage.append(renderStandard(records, "list"));
@@ -671,8 +701,9 @@ function renderRecords() {
 function renderEmpty() {
   const searched = Boolean(state.query);
   const relationshipMeta = state.category === "relationship" ? relationshipKind(state.filter) : null;
-  const title = state.trash ? "Nothing waiting here" : searched ? "No matching markers" : relationshipMeta ? `No ${relationshipMeta.label.toLowerCase()} yet` : `Begin your ${CATEGORIES[state.category].label.toLowerCase()} workspace`;
-  const copy = state.trash ? "Removed entries will appear here until you restore them." : searched ? "Try a shorter phrase or another word." : relationshipMeta?.description || "Your atlas grows one thoughtful entry at a time.";
+  const interestMeta = state.category === "interest" ? interestKind(state.filter) : null;
+  const title = state.trash ? "Nothing waiting here" : searched ? "No matching markers" : relationshipMeta ? `No ${relationshipMeta.label.toLowerCase()} yet` : interestMeta ? `No ${interestMeta.label.toLowerCase()} yet` : `Begin your ${CATEGORIES[state.category].label.toLowerCase()} workspace`;
+  const copy = state.trash ? "Removed entries will appear here until you restore them." : searched ? "Try a shorter phrase or another word." : relationshipMeta?.description || interestMeta?.description || "Your atlas grows one thoughtful entry at a time.";
   const contents = [element("div", { class: "empty-orbit" }, icon(searched ? "search" : state.trash ? "trash" : CATEGORIES[state.category].icon)), element("h2", { text: title }), element("p", { text: copy })];
   if (!state.trash && !searched) contents.push(element("button", { class: "button button-primary", type: "button", onclick: () => openRecordDialog() }, [icon("plus"), "Add the first entry"]));
   return element("section", { class: "empty-state" }, element("div", {}, contents));
@@ -699,6 +730,27 @@ function renderRelationshipOverview(records) {
   return root;
 }
 
+function renderInterestOverview(records) {
+  const root = element("div", { class: "interest-kind-grid" });
+  INTEREST_KINDS.forEach((kind, index) => {
+    const count = records.filter((record) => record.data?.kind === kind.value).length;
+    root.append(element("article", {
+      class: "interest-kind-card",
+      style: { "--interest-accent": kind.accent, "animation-delay": `${index * 35}ms` }
+    }, [
+      element("div", { class: "interest-kind-top" }, [
+        element("span", { class: "interest-kind-symbol" }, icon(kind.icon)),
+        element("span", { class: "interest-kind-count", text: String(count) })
+      ]),
+      element("h2", { text: kind.label }),
+      element("p", { text: kind.description }),
+      element("span", { class: "interest-kind-open" }, [`View ${kind.label.toLowerCase()}`, icon("chevron")]),
+      element("button", { type: "button", "aria-label": `View ${kind.label}`, onclick: () => navigateTo({ kind: "list", category: "interest", filter: kind.value }) })
+    ]));
+  });
+  return root;
+}
+
 function renderFailure(error) {
   const stage = $("#content-stage");
   stage.replaceChildren(element("section", { class: "empty-state" }, element("div", {}, [
@@ -715,9 +767,10 @@ function renderStandard(records, mode) {
   records.forEach((record, index) => {
     const meta = CATEGORIES[record.category] || CATEGORIES.resource;
     const relationshipMeta = record.category === "relationship" ? relationshipKind(record.data?.kind) : null;
-    const itemLabel = relationshipMeta?.label || meta.label;
-    const itemIcon = relationshipMeta?.icon || meta.icon;
-    const itemAccent = relationshipMeta?.accent || meta.accent;
+    const interestMeta = record.category === "interest" ? interestKind(record.data?.kind) : null;
+    const itemLabel = relationshipMeta?.label || interestMeta?.singular || meta.label;
+    const itemIcon = relationshipMeta?.icon || interestMeta?.icon || meta.icon;
+    const itemAccent = relationshipMeta?.accent || interestMeta?.accent || meta.accent;
     if (mode === "list") {
       root.append(element("article", { class: "record-row", style: { "--animation-order": index } }, [
         element("div", { class: "category-symbol", style: { "--record-accent": itemAccent } }, icon(itemIcon)),
@@ -863,7 +916,7 @@ async function openDetail(id, { fromRoute = false } = {}) {
     await navigateTo({ kind: "detail", category: record.category, id });
     return;
   }
-  if (!fromRoute && record && ["person", "preference"].includes(record.category)) {
+  if (!fromRoute && record && ["person", "interest"].includes(record.category)) {
     await navigateTo({ kind: "detail", category: record.category, id });
     return;
   }
@@ -1027,8 +1080,9 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
   } else root.replaceChildren();
   const meta = CATEGORIES[record.category] || CATEGORIES.resource;
   const relationshipMeta = record.category === "relationship" ? relationshipKind(record.data?.kind) : null;
+  const interestMeta = record.category === "interest" ? interestKind(record.data?.kind) : null;
   if (record.trashed || record.deletedAt) root.append(element("div", { class: "removed-banner" }, [icon("trash"), element("span", { text: "This entry is in recently removed." })]));
-  root.append(element("div", { class: "detail-category" }, [icon(relationshipMeta?.icon || meta.icon), relationshipMeta ? `Relationship · ${relationshipMeta.label}` : meta.label]));
+  root.append(element("div", { class: "detail-category" }, [icon(relationshipMeta?.icon || interestMeta?.icon || meta.icon), relationshipMeta ? `Relationship · ${relationshipMeta.label}` : interestMeta ? `Interest · ${interestMeta.singular}` : meta.label]));
   const title = element("h2", { id: fullPage ? "detail-page-title" : "detail-title", text: recordTitle(record) });
   root.append(title, element("p", { class: "detail-lede", text: recordSummary(record) || "No description yet." }));
   if (record.category === "goal") root.append(renderGoalProgression(record));
@@ -1036,7 +1090,8 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
   const summaryKey = {
     person: "summary", experience: "narrative", goal: "description",
     project: "context", resource: "notes",
-    relationship: record.data?.notes ? "notes" : "relationshipType", preference: "value"
+    relationship: record.data?.notes ? "notes" : "relationshipType",
+    interest: record.data?.kind === "hobby" ? "description" : "value"
   }[record.category];
   const skipped = new Set([summaryKey, ...(record.category === "goal" ? ["progress"] : []), ...PERSON_SENSITIVE_KEYS]);
   if (record.category === "goal" && record.parentId) {
@@ -1050,7 +1105,7 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
       }, [element("span", { text: parentTitle }), icon("chevron")]))
     );
   }
-  (FIELD_DEFS[record.category] || []).forEach(([key, label, type]) => {
+  recordFieldDefinitions(record.category, record.data).forEach(([key, label, type]) => {
     const value = record.data?.[key];
     if (value === undefined || value === null || value === "" || (Array.isArray(value) && !value.length) || skipped.has(key)) return;
     const displayValue = record.category === "relationship" && key === "kind" ? relationshipKind(value)?.label || friendly(value) : displayDetailValue(value, type);
@@ -1110,8 +1165,9 @@ function renderDetail(record, target = $("#detail-content"), fullPage = false) {
     const targetTitle = target ? recordTitle(target) : "linked entry";
     const targetMeta = target ? (CATEGORIES[target.category] || CATEGORIES.resource) : null;
     const targetRelationshipMeta = target?.category === "relationship" ? relationshipKind(target.data?.kind) : null;
-    const targetIcon = targetRelationshipMeta?.icon || targetMeta?.icon || "link";
-    const targetAccent = targetRelationshipMeta?.accent || targetMeta?.accent;
+    const targetInterestMeta = target?.category === "interest" ? interestKind(target.data?.kind) : null;
+    const targetIcon = targetRelationshipMeta?.icon || targetInterestMeta?.icon || targetMeta?.icon || "link";
+    const targetAccent = targetRelationshipMeta?.accent || targetInterestMeta?.accent || targetMeta?.accent;
     linked.append(element("div", { class: "linked-item" }, [
       element("span", { style: targetAccent ? { "--record-accent": targetAccent } : {} }, icon(targetIcon)), element("div", { class: "linked-copy" }, [element("strong", { text: targetTitle }), element("small", { text: `${link.direction === "in" ? "Linked here" : "Links to"}${link.label ? ` · ${link.label}` : ""}` })]),
       element("div", { class: "linked-actions" }, [
@@ -1150,7 +1206,6 @@ function setKnowledgeChrome() {
   $("#view-toggle").hidden = true;
   $("#empty-trash").hidden = true;
   $("#new-record").hidden = true;
-  $("#new-record-top").hidden = true;
   $$(".category-nav .nav-row").forEach((button) => button.classList.toggle("active", button.dataset.workspace === "knowledge"));
   $("#settings-button")?.classList.remove("active");
 }
@@ -1728,6 +1783,33 @@ function customFieldInput(field, value) {
   return wrapper;
 }
 
+function appendInterestForm(fields, record, initialKind) {
+  const kind = interestKind(initialKind)?.value || "hobby";
+  const titleField = inputForDefinition(["title", interestKind(kind)?.singular || "Interest", "text", true,
+    kind === "hobby" ? "A concise hobby or interest" : "A memorable label"], record?.title ?? "");
+  fields.append(titleField, inputForDefinition(INTEREST_KIND_FIELD, kind));
+  INTEREST_KINDS.forEach(({ value }) => {
+    const group = element("div", { class: "interest-kind-fields", dataset: { interestKind: value } });
+    INTEREST_FIELD_DEFS[value].forEach((definition) => group.append(inputForDefinition(definition, record?.data?.[definition[0]] ?? "")));
+    fields.append(group);
+  });
+  const kindControl = $("[name='kind']", fields);
+  const titleControl = $("[name='title']", fields);
+  const titleLabel = titleControl?.closest(".field")?.querySelector("span");
+  const syncKind = () => {
+    const selected = interestKind(kindControl.value) || interestKind("hobby");
+    if (titleLabel) titleLabel.textContent = selected.singular;
+    if (titleControl) titleControl.placeholder = selected.value === "hobby" ? "A concise hobby or interest" : "A memorable label";
+    $$(".interest-kind-fields", fields).forEach((group) => {
+      const active = group.dataset.interestKind === selected.value;
+      group.hidden = !active;
+      $$('input,textarea,select', group).forEach((control) => { control.disabled = !active; });
+    });
+  };
+  kindControl?.addEventListener("change", syncKind);
+  syncKind();
+}
+
 async function openRecordDialog(record = null) {
   state.editing = record;
   const category = record?.category || state.category;
@@ -1747,7 +1829,10 @@ async function openRecordDialog(record = null) {
   $("#record-dialog-title").textContent = record ? `Edit ${meta.label.toLowerCase()}` : `Add ${meta.label.toLowerCase()}`;
   const fields = $("#record-fields");
   fields.replaceChildren();
-  (FIELD_DEFS[category] || []).forEach((definition) => {
+  if (category === "interest") {
+    const kind = record?.data?.kind || (interestKind(state.filter)?.value ?? "hobby");
+    appendInterestForm(fields, record, kind);
+  } else (FIELD_DEFS[category] || []).forEach((definition) => {
     let value = definition[0] === "title" ? record?.title : category === "person" ? personData(record)[definition[0]] : record?.data?.[definition[0]];
     if (!record && category === "relationship" && definition[0] === "kind" && relationshipKind(state.filter)) value = state.filter;
     if (!record && category === "goal" && definition[0] === "importance") value = "medium";
@@ -1784,9 +1869,11 @@ async function saveRecord(event) {
   const form = event.currentTarget;
   if (!form.reportValidity()) return;
   const category = form.dataset.category;
-  const data = {};
+  const interestKindValue = category === "interest" ? form.elements.kind.value : null;
+  const data = category === "interest" ? { ...(state.editing?.data || {}) } : {};
   const customFieldValues = { ...(state.editing?.customFieldValues || {}) };
-  (FIELD_DEFS[category] || []).forEach(([key, , type]) => {
+  const definitions = category === "interest" ? interestDefinitions(interestKindValue) : FIELD_DEFS[category] || [];
+  definitions.forEach(([key, , type]) => {
     if (key === "title") return;
     if (type === "repeatable" || type === "repeatableEmail") {
       const values = $$(`[data-repeatable="${key}"] input`, form).map((input) => input.value.trim()).filter(Boolean);
@@ -2091,7 +2178,6 @@ function setSettingsChrome() {
   $("#view-toggle").hidden = true;
   $("#empty-trash").hidden = true;
   $("#new-record").hidden = true;
-  $("#new-record-top").hidden = true;
   $$(".category-nav .nav-row").forEach((button) => button.classList.remove("active"));
   $("#settings-button")?.classList.add("active");
 }
@@ -2317,7 +2403,6 @@ function wireEvents() {
     finally { setButtonBusy(button, false); }
   });
   $("#new-record").addEventListener("click", openPrimaryCreate);
-  $("#new-record-top").addEventListener("click", openPrimaryCreate);
   $("#record-form").addEventListener("submit", saveRecord);
   $("#clear-all-form").addEventListener("submit", clearAllAtlas);
   $("#close-detail").addEventListener("click", closeDetail);

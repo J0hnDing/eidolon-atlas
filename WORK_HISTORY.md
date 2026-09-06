@@ -140,3 +140,16 @@ Added distinct operation descriptions to all Knowledge and Agent OpenAPI operati
 ### Limitations
 
 In-app visual browser automation was unavailable due to a runtime bootstrap conflict; the restarted production server is locked and requires the user to unlock it before manual Settings inspection.
+
+## 2026-08-14 00:19 — Removed Agent API and key management
+
+- Category: refactor
+- Area: API and Settings
+
+### Summary
+
+Removed all Bearer Agent and agent-key routes, catalogs, projections, controls, styles, and documentation. Retained only native unlocked and Knowledge OpenAPI references, reduced the local contract to 42 operations, and added automatic legacy agent-key verifier purge. Added retired-route, contract, Knowledge, lock, and migration coverage; npm run check passes 29 tests and live HTTP checks confirmed the new contract.
+
+### Limitations
+
+In-app browser visual QA was unavailable because the browser-control runtime failed to initialize; automated UI-independent Atlas checks and live HTTP verification passed.

@@ -22,6 +22,8 @@ import {
 const KEY_CONFIG = 'encryption-config';
 const KEY_CHECK = 'key-check';
 const LEGACY_AGENT_KEY = 'agent-key';
+const LEGACY_PREFERENCE_CATEGORY = 'preference';
+const INTEREST_CATEGORY = 'interest';
 export const IMAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const IMAGE_MAX_PER_EXPERIENCE = 50;
 export const BACKUP_UPLOAD_MAX_BYTES = 2 * 1024 * 1024 * 1024;
@@ -122,6 +124,21 @@ function goalDataWithoutLegacyText(data) {
   return next;
 }
 
+function preferenceDataWithKind(data) {
+  return { ...(data ?? {}), kind: 'preference' };
+}
+
+function migrateLegacyPreferenceRecord(value, forceLegacyCategory = false) {
+  if (!value || typeof value !== 'object') return value;
+  if (!forceLegacyCategory && value.category !== LEGACY_PREFERENCE_CATEGORY) return value;
+  return { ...value, category: INTEREST_CATEGORY, data: preferenceDataWithKind(value.data) };
+}
+
+function migrateLegacyPreferenceCategory(value) {
+  if (!value || typeof value !== 'object' || value.category !== LEGACY_PREFERENCE_CATEGORY) return value;
+  return { ...value, category: INTEREST_CATEGORY };
+}
+
 function imageType(bytes) {
   if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return 'image/png';
@@ -217,6 +234,7 @@ export class Atlas {
       const key = await this.#deriveConfiguredKey(passphrase, generation);
       this.#advanceLifecycle(generation);
       this.#replaceKey(key);
+      this.#migrateLegacyPreferenceRecords();
       this.#migrateRelationshipKinds();
       this.#migrateGoalData();
       this.#seedKnowledge();
@@ -1647,7 +1665,8 @@ export class Atlas {
     void fieldIds; void linkIds;
     let people = 0;
     const records = snapshot.records.map((record) => {
-      const migrated = record?.category === 'goal' ? { ...record, data: goalDataWithoutLegacyText(record.data) } : record;
+      let migrated = record?.category === 'goal' ? { ...record, data: goalDataWithoutLegacyText(record.data) } : record;
+      migrated = migrateLegacyPreferenceRecord(migrated);
       const content = normalizeRecord(migrated);
       if (content.category === 'person') people += 1;
       requireRevision(record.revision);
@@ -1680,7 +1699,8 @@ export class Atlas {
       }
     }
     const customFields = snapshot.customFields.map((field) => {
-      const normalized = normalizeCustomField(field);
+      const migrated = migrateLegacyPreferenceCategory(field);
+      const normalized = normalizeCustomField(migrated);
       if (typeof field.createdAt !== 'string' || typeof field.updatedAt !== 'string') fail(400, 'INVALID_BACKUP', 'A custom field has invalid timestamps.');
       if (field.archived !== undefined && typeof field.archived !== 'boolean') fail(400, 'INVALID_BACKUP', 'A custom field has invalid archived state.');
       return { id: field.id, ...normalized, archived: Boolean(field.archived),
@@ -1701,17 +1721,21 @@ export class Atlas {
       }
     }
     const revisions = snapshot.revisions.map((revision) => {
-      if (!recordIds.has(revision.recordId) || !CATEGORIES.includes(revision.category)) fail(400, 'INVALID_BACKUP', 'A revision references an invalid record.');
-      if (byId.get(revision.recordId).category !== revision.category) fail(400, 'INVALID_BACKUP', 'A revision category does not match its record.');
-      requireRevision(revision.revision);
-      if (typeof revision.createdAt !== 'string' || !revision.snapshot) fail(400, 'INVALID_BACKUP', 'A revision is invalid.');
-      const migratedSnapshot = revision.category === 'goal'
-        ? { ...revision.snapshot, data: goalDataWithoutLegacyText(revision.snapshot.data) }
-        : revision.snapshot;
+      const migratedRevision = revision?.category === LEGACY_PREFERENCE_CATEGORY
+        ? { ...revision, category: INTEREST_CATEGORY,
+          snapshot: migrateLegacyPreferenceRecord(revision.snapshot, true) }
+        : revision;
+      if (!recordIds.has(migratedRevision.recordId) || !CATEGORIES.includes(migratedRevision.category)) fail(400, 'INVALID_BACKUP', 'A revision references an invalid record.');
+      if (byId.get(migratedRevision.recordId).category !== migratedRevision.category) fail(400, 'INVALID_BACKUP', 'A revision category does not match its record.');
+      requireRevision(migratedRevision.revision);
+      if (typeof migratedRevision.createdAt !== 'string' || !migratedRevision.snapshot) fail(400, 'INVALID_BACKUP', 'A revision is invalid.');
+      const migratedSnapshot = migratedRevision.category === 'goal'
+        ? { ...migratedRevision.snapshot, data: goalDataWithoutLegacyText(migratedRevision.snapshot.data) }
+        : migrateLegacyPreferenceRecord(migratedRevision.snapshot);
       const normalized = normalizeRecord(migratedSnapshot);
-      if (normalized.category !== revision.category) fail(400, 'INVALID_BACKUP', 'A revision category does not match.');
-      if (typeof revision.snapshot.trashed !== 'boolean') fail(400, 'INVALID_BACKUP', 'A revision has invalid trash state.');
-      const parentId = revision.snapshot.parentId ?? null;
+      if (normalized.category !== migratedRevision.category) fail(400, 'INVALID_BACKUP', 'A revision category does not match.');
+      if (typeof migratedRevision.snapshot.trashed !== 'boolean') fail(400, 'INVALID_BACKUP', 'A revision has invalid trash state.');
+      const parentId = migratedRevision.snapshot.parentId ?? null;
       if (normalized.category !== 'goal' && parentId !== null) fail(400, 'INVALID_BACKUP', 'Only goal revisions may have parents.');
       if (parentId !== null && (!byId.has(parentId) || byId.get(parentId).category !== 'goal')) {
         fail(400, 'INVALID_BACKUP', 'A goal revision has an invalid parent.');
@@ -1722,8 +1746,8 @@ export class Atlas {
         if (definition.category !== normalized.category) fail(400, 'INVALID_BACKUP', 'A custom field is used by the wrong revision category.');
         validateCustomFieldValue(definition, value);
       }
-      return { ...revision, snapshot: { ...normalized, parentId: revision.snapshot.parentId ?? null,
-        position: integerPosition(revision.snapshot.position) ?? 0, trashed: Boolean(revision.snapshot.trashed) } };
+      return { ...migratedRevision, snapshot: { ...normalized, parentId: migratedRevision.snapshot.parentId ?? null,
+        position: integerPosition(migratedRevision.snapshot.position) ?? 0, trashed: Boolean(migratedRevision.snapshot.trashed) } };
     });
     const revisionGroups = new Map();
     for (const revision of revisions) {
@@ -2062,6 +2086,52 @@ export class Atlas {
     return { id: row.id, name: value.name, branch: row.branch, parentId: row.parent_id,
       status: row.status, understanding: value.understanding ?? null, terms: value.terms ?? [],
       revision: row.revision, createdAt: row.created_at, updatedAt: row.updated_at };
+  }
+
+  #migrateLegacyPreferenceRecords() {
+    const records = this.#db.prepare('SELECT * FROM records WHERE category = ?').all(LEGACY_PREFERENCE_CATEGORY);
+    const revisions = this.#db.prepare('SELECT * FROM record_revisions WHERE category = ?').all(LEGACY_PREFERENCE_CATEGORY);
+    const customFields = this.#db.prepare('SELECT * FROM custom_fields WHERE category = ?').all(LEGACY_PREFERENCE_CATEGORY);
+    if (!records.length && !revisions.length && !customFields.length) return;
+    transaction(this.#db, () => {
+      for (const row of records) {
+        const value = decryptJson(this.#key, row.payload,
+          objectAad('record', row.id, row.revision, LEGACY_PREFERENCE_CATEGORY));
+        const data = preferenceDataWithKind(value.data);
+        const content = normalizeRecord({ category: INTEREST_CATEGORY, title: value.title, data,
+          customFieldValues: value.customFieldValues ?? {} });
+        this.#db.prepare('UPDATE records SET category = ?, payload = ? WHERE id = ?').run(
+          INTEREST_CATEGORY,
+          encryptJson(this.#key, { ...value, data: content.data },
+            objectAad('record', row.id, row.revision, INTEREST_CATEGORY)),
+          row.id,
+        );
+      }
+      for (const row of revisions) {
+        const snapshot = decryptJson(this.#key, row.payload,
+          objectAad('revision', row.record_id, row.revision, LEGACY_PREFERENCE_CATEGORY));
+        const data = preferenceDataWithKind(snapshot.data);
+        const content = normalizeRecord({ category: INTEREST_CATEGORY, title: snapshot.title, data,
+          customFieldValues: snapshot.customFieldValues ?? {} });
+        const migratedSnapshot = { ...snapshot, ...content, category: INTEREST_CATEGORY };
+        this.#db.prepare('UPDATE record_revisions SET category = ?, payload = ? WHERE record_id = ? AND revision = ?').run(
+          INTEREST_CATEGORY,
+          encryptJson(this.#key, migratedSnapshot,
+            objectAad('revision', row.record_id, row.revision, INTEREST_CATEGORY)),
+          row.record_id,
+          row.revision,
+        );
+      }
+      for (const row of customFields) {
+        const value = decryptJson(this.#key, row.payload,
+          objectAad('custom-field', row.id, 1, LEGACY_PREFERENCE_CATEGORY));
+        this.#db.prepare('UPDATE custom_fields SET category = ?, payload = ? WHERE id = ?').run(
+          INTEREST_CATEGORY,
+          encryptJson(this.#key, value, objectAad('custom-field', row.id, 1, INTEREST_CATEGORY)),
+          row.id,
+        );
+      }
+    });
   }
 
   #assertUniqueKnowledgeSibling(name, branch, parentId, excludeId = undefined) {

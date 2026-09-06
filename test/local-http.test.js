@@ -86,6 +86,14 @@ test('Settings publishes the complete native and Knowledge contracts', async (t)
   assert.equal(browserOperations.length, 43);
   assert.ok(browserOperations.every(({ operation }) => operation.description?.trim()));
   assert.ok(browserOperations.every(({ route }) => !route.includes('/api/agent')));
+  assert.deepEqual(referenceBody.browserOpenapi.components.schemas.RecordCategory.enum,
+    ['person', 'experience', 'goal', 'project', 'resource', 'relationship', 'interest']);
+  assert.deepEqual(referenceBody.browserOpenapi.components.schemas.InterestHobbyData.required, ['kind']);
+  assert.deepEqual(referenceBody.browserOpenapi.components.schemas.InterestPreferenceData.required, ['kind', 'value']);
+  assert.deepEqual(referenceBody.browserOpenapi.components.schemas.InterestHobbyData.properties.engagement.enum,
+    ['casual', 'regular', 'serious', 'past']);
+  assert.deepEqual(referenceBody.browserOpenapi.components.schemas.InterestHobbyData.properties.skillLevel.enum,
+    ['beginner', 'intermediate', 'advanced', 'expert']);
   const imageUpload = referenceBody.browserOpenapi.paths['/api/records/{id}/images'].post;
   assert.deepEqual(imageUpload.parameters, [{
     name: 'X-Atlas-Filename', in: 'header', required: true,
